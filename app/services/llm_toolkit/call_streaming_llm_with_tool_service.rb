@@ -442,27 +442,6 @@ module LlmToolkit
         
         Rails.logger.debug("Found special case: get_url tool and a URL in another tool: #{@special_url_input}")
       end
-
-      # Look for query-related tools
-      search_tools = tool_calls.select { |tc| 
-        name = tc.dig("function", "name")
-        ["vector_search", "text_search"].include?(name)
-      }
-
-      # Look for query in other tool calls
-      query_tools = tool_calls.select do |tc|
-        function_args = tc.dig("function", "arguments") || "{}"
-        args = begin
-          JSON.parse(function_args) rescue {}
-        end
-        tc.dig("function", "name") !~ /search/ && args["query"].present?
-      end
-
-      # If we found both a search tool and a tool with a query, log it
-      if search_tools.any? && query_tools.any?
-        query_tool = query_tools.first
-        Rails.logger.debug("Found potential search pattern: search tool and query in another tool")
-      end
     end
     
     # Handle the special case of a get_url tool where the URL is in a separate tool call
@@ -520,25 +499,6 @@ module LlmToolkit
         tool_calls = tool_calls.reject { |tc| tc == url_tool }
       end
 
-      # Check for search tools with empty query but another tool has a query
-      search_tools = tool_calls.select { |tc| ["vector_search", "text_search"].include?(tc["name"]) && tc["input"]["query"].blank? }
-      query_tools = tool_calls.select { |tc| tc["input"].is_a?(Hash) && tc["input"]["query"].present? && !["vector_search", "text_search"].include?(tc["name"]) }
-      
-      if search_tools.any? && query_tools.any?
-        # Get the first search tool with missing query
-        search_tool = search_tools.first
-        query_tool = query_tools.first
-        
-        # Update the search tool with the query
-        search_tool["input"]["query"] = query_tool["input"]["query"]
-        
-        # Log the change
-        Rails.logger.info("Updated #{search_tool["name"]} with query '#{query_tool["input"]["query"]}' from another tool")
-        
-        # Remove the query tool from processing
-        tool_calls = tool_calls.reject { |tc| tc == query_tool }
-      end
-      
       # Now process each valid tool call
       tool_calls.each do |tool_use|
         next unless tool_use.is_a?(Hash)

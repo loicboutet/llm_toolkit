@@ -44,7 +44,8 @@ module LlmToolkit
           messages: messages,
           stream: false,
           usage: true,
-          max_tokens: max_tokens
+          max_tokens: max_tokens,
+          usage: {include: true},
         }
 
         tools = Array(tools)

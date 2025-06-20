@@ -291,13 +291,6 @@ module LlmToolkit
         # Try to parse the arguments string into a hash
         input = parse_tool_arguments(function['arguments'])
         
-        # Handle special case: vector_search vs text_search
-        # If name is missing but we have query parameter, use appropriate search tool
-        if !has_name && input["query"].present?
-          # Choose which search to use based on context or default to vector_search
-          function['name'] = "vector_search"
-        end
-        
         # Return the standardized format expected by our system
         {
           "name" => function['name'],
