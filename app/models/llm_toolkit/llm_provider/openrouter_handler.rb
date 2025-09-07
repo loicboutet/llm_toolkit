@@ -43,7 +43,9 @@ module LlmToolkit
           model: model_name,
           messages: messages,
           stream: false,
-          usage: true,
+          usage: {
+            include: true
+          },
           max_tokens: max_tokens,
           usage: {include: true},
         }
@@ -134,8 +136,9 @@ module LlmToolkit
           model: model_name,
           messages: messages,
           stream: true, # Enable streaming
-          usage: true
-        }
+          usage: {
+            include: true
+          },        }
 
         tools = Array(tools)
         if tools.present?
