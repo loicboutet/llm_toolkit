@@ -47,7 +47,7 @@ module LlmToolkit
             required: build_required_params
           }
         }
-        Rails.logger.debug "Tool definition for #{self.name}: #{result.inspect}" if defined?(Rails)
+        #Rails.logger.debug "Tool definition for #{self.name}: #{result.inspect}" if defined?(Rails)
         result
       end
       

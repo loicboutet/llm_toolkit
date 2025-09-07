@@ -7,7 +7,7 @@ module LlmToolkit
       # Get definitions and log them
       defs = tools.map do |tool|
         definition = tool.definition
-        Rails.logger.info "Tool definition for #{tool.name}: #{definition.inspect}"
+        #Rails.logger.info "Tool definition for #{tool.name}: #{definition.inspect}"
         definition
       end
       

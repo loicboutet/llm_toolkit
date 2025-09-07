@@ -609,7 +609,7 @@ module LlmToolkit
       
       begin
         # Log the tool definition for debugging
-        Rails.logger.info("Tool definition for #{tool_class}: #{tool_class.definition}")
+        #Rails.logger.info("Tool definition for #{tool_class}: #{tool_class.definition}")
         
         # Execute the tool
         result = tool_class.execute(conversable: @conversable, args: tool_use.input, tool_use: tool_use)
