@@ -136,14 +136,20 @@ module LlmToolkit
         return result
       elsif result.is_a?(Hash)
         if result[:result].present?
-          # Handle result hash format
-          if result[:result].is_a?(Hash) || result[:result].is_a?(Array)
+          # Handle result hash format  
+          # ✅ FIXED: Always return the inner result as-is if it's a string
+          inner_result = result[:result]
+          
+          if inner_result.is_a?(String)
+            # For strings, return directly without conversion
+            return inner_result
+          elsif inner_result.is_a?(Hash) || inner_result.is_a?(Array)
             # For complex data structures, convert to a readable string format
             # rather than Ruby's inspect format which includes symbols
-            return JSON.pretty_generate(result[:result]) rescue result[:result].to_s
+            return JSON.pretty_generate(inner_result) rescue inner_result.to_s
           else
-            # For simple values, convert to string
-            return result[:result].to_s
+            # For other simple values, convert to string
+            return inner_result.to_s
           end
         elsif result[:error].present?
           # Handle error hash format

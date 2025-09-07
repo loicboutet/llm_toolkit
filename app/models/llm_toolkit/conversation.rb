@@ -433,22 +433,25 @@ module LlmToolkit
           # Format the content properly for OpenRouter
           tool_result_content = tool_result.content.to_s
           
-          # Clean up any Ruby object notation (basic attempt)
+          # ✅ FIXED: Better Ruby hash notation cleanup that handles escaped quotes
           if tool_result_content.include?('=>') && tool_result_content.strip.start_with?('{') && tool_result_content.strip.end_with?('}')
              begin
                # Attempt to parse as JSON first
                parsed = JSON.parse(tool_result_content)
                tool_result_content = parsed.to_json # Re-serialize to ensure valid JSON
              rescue JSON::ParserError
-               # If JSON parsing fails, try a simple regex for common patterns
+               # If JSON parsing fails, try to extract the result value more carefully
                Rails.logger.warn("Ruby hash notation detected in tool result, attempting cleanup for tool #{tool_use.name}")
-               if tool_result_content =~ /:result\s*=>\s*"(.*?)"/m # Match multiline result string
-                 tool_result_content = $1
-               elsif tool_result_content =~ /:result\s*=>\s*(.*?)\s*(?:,\s*:|\})/m # Match non-string result
-                 tool_result_content = $1
+               
+               # Try to extract the :result value using a more robust approach
+               if tool_result_content =~ /:result\s*=>\s*"(.*)"\s*\}/m
+                 # Extract everything between the first quote and the last quote before the closing brace
+                 extracted_content = $1
+                 # Unescape the content - convert \\n to \n, \\\" to \", etc.
+                 tool_result_content = extracted_content.gsub('\\"', '"').gsub('\\n', "\n").gsub('\\\\', '\\')
                else
-                  # Fallback: Keep original if cleanup fails
-                  Rails.logger.warn("Could not reliably clean Ruby hash notation for tool #{tool_use.name}")
+                 # Fallback: Keep original if extraction fails
+                 Rails.logger.warn("Could not reliably clean Ruby hash notation for tool #{tool_use.name}")
                end
              end
           end
