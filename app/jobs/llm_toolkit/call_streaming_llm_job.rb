@@ -48,13 +48,18 @@ module LlmToolkit
         Rails.logger.info("   Lovelace tools: #{lovelace_tool_names.join(', ')}")
       end
 
-      # Create the initial empty assistant message with the FINAL llm_model
-      # For CUA, we still associate with original model but handle specially
+      # 🚨 FIX: Create initial status message instead of empty message
+      initial_content = if use_direct_cua
+        "🎯 Analyse automatique en cours..."
+      else
+        "🤔 Traitement de votre demande..."
+      end
+
       assistant_message = conversation.messages.create!(
         role: 'assistant',
-        content: '',
+        content: initial_content, # ✅ Now has meaningful content
         user_id: user_id,
-        llm_model: use_direct_cua ? original_llm_model : final_llm_model # Keep original for CUA tracking
+        llm_model: use_direct_cua ? original_llm_model : final_llm_model
       )
 
       # Set up Thread.current[:current_user_id] for tools that need it
