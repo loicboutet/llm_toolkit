@@ -4,6 +4,12 @@ require 'turbo-rails'
 module LlmToolkit
   class CallStreamingLlmWithToolService
     # Rendering helpers removed - broadcasting raw chunks
+    
+    # Placeholder markers to detect and clear initial "thinking" messages
+    PLACEHOLDER_MARKERS = [
+      "🤔 Traitement de votre demande...",
+      "🎯 Analyse automatique en cours..."
+    ].freeze
 
     attr_reader :llm_model, :llm_provider, :conversation, :assistant_message, :conversable, :role, :tools, :user_id, :tool_classes, :broadcast_to
 
@@ -34,9 +40,17 @@ module LlmToolkit
       
       # Initialize variables to track streamed content using the passed message
       @current_message = @assistant_message # Use the passed message
-      @current_content = @current_message.content || "" # Initialize content from message
+      
+      # Check if the initial content is a placeholder that should be cleared
+      initial_content = @current_message.content || ""
+      @is_placeholder_content = PLACEHOLDER_MARKERS.any? { |marker| initial_content.include?(marker) }
+      
+      # If it's a placeholder, start with empty content (will be replaced on first chunk)
+      # Otherwise, keep the existing content for appending
+      @current_content = @is_placeholder_content ? "" : initial_content
+      
       @content_complete = false
-      @content_chunks_received = @current_content.present?
+      @content_chunks_received = !@is_placeholder_content && initial_content.present?
       # @current_tool_calls = [] # Replaced by accumulated_tool_calls
       @accumulated_tool_calls = {} # Accumulate tool call chunks by index
       @processed_tool_call_ids = Set.new
@@ -207,6 +221,7 @@ module LlmToolkit
       @content_chunks_received = false
       @tool_results_pending = false
       @finish_reason = nil
+      @is_placeholder_content = false # Follow-up messages don't have placeholders
       
       # Get updated conversation history with tool results
       sys_prompt = if @conversable.respond_to?(:generate_system_messages)
