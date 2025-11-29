@@ -30,8 +30,8 @@ module LlmToolkit
       # Log the switch if it happened
       if final_llm_model != original_llm_model
         Rails.logger.info("🔄 LOVELACE MODEL SWITCH:")
-        Rails.logger.info("   Original model: #{original_llm_model.model_name}")
-        Rails.logger.info("   Switched to: #{final_llm_model.model_name}")
+        Rails.logger.info("   Original model: #{original_llm_model.name}")
+        Rails.logger.info("   Switched to: #{final_llm_model.name}")
         
         if use_direct_cua
           Rails.logger.info("   🎯 Using DIRECT OpenAI computer-use-preview for CUA")
@@ -41,11 +41,11 @@ module LlmToolkit
         
         # Log which tools triggered the switch
         lovelace_tools = tool_classes.select do |tool_class|
-          tool_name = tool_class.definition[:name] rescue tool_class.to_s
-          LlmToolkit::LovelaceModelSwitcher::LOVELACE_TOOLS.include?(tool_name)
+          tool_name = tool_class.respond_to?(:definition) ? tool_class.definition[:name] : tool_class.to_s.demodulize.underscore
+          LlmToolkit::LovelaceModelSwitcher::CUA_BROWSER_TOOLS.include?(tool_name)
         end
-        lovelace_tool_names = lovelace_tools.map { |tc| tc.definition[:name] rescue tc.to_s }
-        Rails.logger.info("   Lovelace tools: #{lovelace_tool_names.join(', ')}")
+        lovelace_tool_names = lovelace_tools.map { |tc| tc.respond_to?(:definition) ? tc.definition[:name] : tc.to_s.demodulize.underscore }
+        Rails.logger.info("   CUA browser tools: #{lovelace_tool_names.join(', ')}")
       end
 
       # 🚨 FIX: Create initial status message instead of empty message
@@ -78,7 +78,7 @@ module LlmToolkit
           broadcast_to: broadcast_to
         )
       else
-        Rails.logger.info("🔄 Using standard streaming service with switched model: #{final_llm_model.model_name}")
+        Rails.logger.info("🔄 Using standard streaming service with model: #{final_llm_model.name}")
         
         # Use the standard streaming service with the switched OpenAI model
         service = LlmToolkit::CallStreamingLlmWithToolService.new(
