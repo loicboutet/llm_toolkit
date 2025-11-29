@@ -33,11 +33,8 @@ module LlmToolkit
           model: model_name,
           messages: messages,
           stream: false,
-          usage: {
-            include: true
-          },
           max_tokens: max_tokens,
-          usage: {include: true},
+          usage: { include: true }
         }
 
         tools = Array(tools)
@@ -115,10 +112,9 @@ module LlmToolkit
         request_body = {
           model: model_name,
           messages: messages,
-          stream: true, # Enable streaming
-          usage: {
-            include: true
-          },        }
+          stream: true,
+          usage: { include: true }
+        }
 
         tools = Array(tools)
         if tools.present?
@@ -169,6 +165,10 @@ module LlmToolkit
           end
         end
         
+        # Process any remaining data in the buffer after streaming completes
+        # This ensures we capture usage data that may arrive in the final chunk
+        process_remaining_buffer(streaming_state, &block)
+        
         # Verify response code and return final result
         unless (200..299).cover?(response.status)
           Rails.logger.error("OpenRouter API streaming error: Status #{response.status}")
@@ -177,6 +177,9 @@ module LlmToolkit
         
         # Format the final result
         formatted_tool_calls = format_tools_response_from_openrouter(streaming_state[:tool_calls]) if streaming_state[:tool_calls].any?
+        
+        # Log final usage info for debugging
+        Rails.logger.info("STREAMING COMPLETE - Final usage_info: #{streaming_state[:usage_info].inspect}")
         
         # Return the complete response object
         {
@@ -262,6 +265,23 @@ module LlmToolkit
         end
       end
       
+      # Process any remaining data in the buffer after streaming completes
+      # This is important because the usage data chunk may not end with a newline
+      def process_remaining_buffer(streaming_state, &block)
+        remaining = streaming_state[:json_buffer].strip
+        return if remaining.empty?
+        
+        Rails.logger.debug("Processing remaining buffer: #{remaining[0..200]}...")
+        
+        # Process any remaining lines
+        remaining.split("\n").each do |line|
+          process_sse_line(line.strip, streaming_state, &block)
+        end
+        
+        # Clear the buffer
+        streaming_state[:json_buffer] = ""
+      end
+      
       # Process a single Server-Sent Events line
       def process_sse_line(line, streaming_state, &block)
         return if line.empty? || line.start_with?(':')
@@ -281,7 +301,7 @@ module LlmToolkit
         begin
           # Parse the chunk JSON
           json_data = JSON.parse(json_str)
-          Rails.logger.info("OpenRouter chunk : #{json_data}")
+          Rails.logger.debug("OpenRouter chunk: #{json_data.inspect}")
 
           # Check if this chunk contains an error - SIMPLE ERROR HANDLING
           if json_data['error'].present?
@@ -338,16 +358,25 @@ module LlmToolkit
       end
       
       # Process individual streaming response chunks
+      # OpenRouter sends usage data in a final chunk with an empty choices array
       def process_streaming_response_chunk(json_data, streaming_state, &block)
         # Record model name if not yet set
         streaming_state[:model_name] ||= json_data['model']
         
-        # Check if this is a tool call chunk
-        first_choice = json_data['choices']&.first
-        return unless first_choice
+        # IMPORTANT: Capture usage data FIRST, before checking choices
+        # OpenRouter sends usage in a separate final chunk with empty choices array:
+        # {"id":"gen-xxx","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
+        if json_data['usage'].present?
+          streaming_state[:usage_info] = json_data['usage']
+          Rails.logger.info("CAPTURED USAGE DATA: #{json_data['usage'].inspect}")
+        end
         
-        # Record usage if present (typically in the final chunk)
-        streaming_state[:usage_info] = json_data['usage'] if json_data['usage']
+        # Check if this is a chunk with choices (content or tool calls)
+        first_choice = json_data['choices']&.first
+        
+        # Return early ONLY if there are no choices AND no usage data
+        # This allows usage-only chunks (empty choices) to be processed above
+        return unless first_choice
         
         # Check for delta for text content
         if first_choice['delta'] && first_choice['delta']['content']

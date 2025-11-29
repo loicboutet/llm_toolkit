@@ -215,7 +215,13 @@ module LlmToolkit
         add_cache_control(history_messages)
       end
 
+      # Filter out empty messages, but NEVER filter out 'tool' messages
+      # Tool messages are required by the API even if their content is empty
+      # This prevents "tool_use ids were found without corresponding tool_result" errors
       return history_messages.reject do |msg|
+        # Never reject tool messages - they are required for API compliance
+        next false if msg[:role] == 'tool'
+        
         is_empty_non_user = msg[:role] != 'user' && msg[:content].blank? && msg[:tool_calls].blank?
         is_empty_user = if provider_type == "anthropic"
                           msg[:role] == 'user' && msg[:content].blank?
@@ -271,6 +277,8 @@ module LlmToolkit
           input: tool_use.input
         }
 
+        # IMPORTANT: Always add a tool_result, even if there was an error or no result
+        # This prevents "tool_use ids were found without corresponding tool_result" errors
         if tool_result = tool_use.tool_result
           is_error_value = tool_result.is_error.nil? ? false : !!tool_result.is_error
           
@@ -284,6 +292,19 @@ module LlmToolkit
               tool_use_id: tool_use.tool_use_id,
               content: sanitized_content,
               is_error: is_error_value
+            }]
+          }
+        else
+          # No tool_result exists - create a synthetic error result to maintain API compliance
+          # This happens when tool execution fails, times out, or the conversation was interrupted
+          Rails.logger.warn("Tool use #{tool_use.id} (#{tool_use.name}) has no tool_result - creating synthetic error response")
+          messages << {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: tool_use.tool_use_id,
+              content: "Tool execution failed or was interrupted. No result was received.",
+              is_error: true
             }]
           }
         end
@@ -335,6 +356,9 @@ module LlmToolkit
           }
         }
 
+        # IMPORTANT: Always add a tool result message for every tool call
+        # This prevents "tool_use ids were found without corresponding tool_result" errors
+        # from the Anthropic API (via OpenRouter)
         if tool_result = tool_use.tool_result
           tool_result_content = tool_result.content.to_s
           
@@ -358,11 +382,39 @@ module LlmToolkit
           # Sanitize tool result content to prevent oversized payloads
           tool_result_content = sanitize_tool_result_content(tool_result_content, tool_use.name)
           
+          # Ensure we never send empty content - provide a fallback message
+          if tool_result_content.blank?
+            tool_result_content = "[Tool completed with empty response]"
+          end
+          
           tool_result_messages << {
             role: "tool",
             tool_call_id: tool_id,
             name: tool_use.name,
             content: tool_result_content
+          }
+        else
+          # No tool_result exists - create a synthetic error result to maintain API compliance
+          # This happens when:
+          # - Tool execution fails or times out (e.g., Lovelace client timeout)
+          # - The conversation was interrupted before tool execution completed
+          # - The tool is still pending approval
+          Rails.logger.warn("Tool use #{tool_use.id} (#{tool_use.name}) has no tool_result - creating synthetic error response for OpenRouter")
+          
+          error_message = case tool_use.status
+          when 'pending'
+            "Tool execution is pending approval and has not been executed yet."
+          when 'rejected'
+            "Tool execution was rejected by the user."
+          else
+            "Tool execution failed, timed out, or was interrupted. No result was received."
+          end
+          
+          tool_result_messages << {
+            role: "tool",
+            tool_call_id: tool_id,
+            name: tool_use.name,
+            content: error_message
           }
         end
       end

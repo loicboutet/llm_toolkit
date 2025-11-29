@@ -122,22 +122,12 @@ module LlmToolkit
       # NOTE: No need to create a message here, it's passed in via initialize
       
       # Call the LLM provider with streaming and handle each chunk
-      # (Provider's stream_chat method will need refactoring later)
-      # TODO: Refactor LlmProvider#stream_chat to accept llm_model details
-      final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model:@llm_model) do |chunk|
+      final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model: @llm_model) do |chunk|
         process_chunk(chunk)
       end
 
       # Update the current message with usage data if available
-      if final_response && final_response['usage']
-        usage = final_response['usage']
-        # Update message with usage, using the renamed column
-        @current_message.update(
-          prompt_tokens: usage['prompt_tokens'].to_i,
-          completion_tokens: usage['completion_tokens'].to_i,
-          api_total_tokens: usage['total_tokens'].to_i # Use renamed column
-        )
-      end
+      update_message_usage_from_response(final_response, @current_message)
 
       # Update the finish_reason from the final response if we don't have one from streaming
       if final_response && final_response['finish_reason'] && @finish_reason.nil?
@@ -195,6 +185,29 @@ module LlmToolkit
       end
     end
 
+    # Update message with usage data from the API response
+    # @param response [Hash] The API response containing usage data
+    # @param message [Message] The message to update
+    def update_message_usage_from_response(response, message)
+      return unless response && message
+      
+      usage = response['usage']
+      
+      # Log what we received for debugging
+      Rails.logger.info("update_message_usage_from_response - response['usage']: #{usage.inspect}")
+      
+      return unless usage
+      
+      # Log usage data for debugging
+      Rails.logger.info("Updating message #{message.id} with usage: prompt_tokens=#{usage['prompt_tokens']}, completion_tokens=#{usage['completion_tokens']}, total_tokens=#{usage['total_tokens']}")
+      
+      message.update(
+        prompt_tokens: usage['prompt_tokens'].to_i,
+        completion_tokens: usage['completion_tokens'].to_i,
+        api_total_tokens: usage['total_tokens'].to_i
+      )
+    end
+
     # Make a follow-up call to the LLM with the tool results
     def followup_with_tools
       # Skip if we're already waiting for approval
@@ -241,22 +254,13 @@ module LlmToolkit
 
       begin
         # Call the LLM provider with streaming and handle each chunk
-        # (Provider's stream_chat method will need refactoring later)
-        # TODO: Refactor LlmProvider#stream_chat to accept llm_model details
-        final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools) do |chunk|
+        # IMPORTANT: Pass llm_model to ensure correct model is used and usage tracked properly
+        final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model: @llm_model) do |chunk|
           process_chunk(chunk)
         end
 
         # Update the current message (the follow-up message) with usage data if available
-        if final_response && final_response['usage']
-          usage = final_response['usage']
-          # Update follow-up message with usage, using the renamed column
-          @current_message.update(
-            prompt_tokens: usage['prompt_tokens'].to_i,
-            completion_tokens: usage['completion_tokens'].to_i,
-            api_total_tokens: usage['total_tokens'].to_i # Use renamed column
-          )
-        end
+        update_message_usage_from_response(final_response, @current_message)
 
         # Update the finish_reason from the final response if we don't have one from streaming
         if final_response && final_response['finish_reason'] && @finish_reason.nil?
@@ -693,7 +697,7 @@ module LlmToolkit
       @conversation.messages.create!(
         role: 'assistant',
         content: '', # Start empty
-        # llm_model: @llm_model, # Removed association
+        llm_model: @llm_model, # Associate with the model for cost tracking
         user_id: @user_id # Ensure user_id is associated if available
       )
     end
