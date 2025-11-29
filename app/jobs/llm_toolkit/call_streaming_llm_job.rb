@@ -20,76 +20,45 @@ module LlmToolkit
       safe_tool_class_names = Array(tool_class_names)
       tool_classes = safe_tool_class_names.map { |class_name| class_name.constantize rescue nil }.compact
 
-      # 🎯 AUTO-SWITCH TO OPENAI FOR LOVELACE TOOLS OR USE DIRECT CUA
-      # Check if we need to switch to an OpenAI model for Lovelace tools
-      final_llm_model = LlmToolkit::LovelaceModelSwitcher.switch_model_if_needed(original_llm_model, tool_classes)
+      # Log available tools for debugging
+      tool_names = tool_classes.map { |tc| tc.respond_to?(:definition) ? tc.definition[:name] : tc.to_s.demodulize.underscore }
+      Rails.logger.info("🔧 Available tools: #{tool_names.join(', ')}")
       
-      # Check if we need to use direct OpenAI CUA (computer-use-preview)
-      use_direct_cua = final_llm_model.respond_to?(:is_cua_model) && final_llm_model.is_cua_model
-
-      # Log the switch if it happened
-      if final_llm_model != original_llm_model
-        Rails.logger.info("🔄 LOVELACE MODEL SWITCH:")
-        Rails.logger.info("   Original model: #{original_llm_model.name}")
-        Rails.logger.info("   Switched to: #{final_llm_model.name}")
-        
-        if use_direct_cua
-          Rails.logger.info("   🎯 Using DIRECT OpenAI computer-use-preview for CUA")
-        else
-          Rails.logger.info("   🔄 Using OpenRouter OpenAI model for Lovelace")
-        end
-        
-        # Log which tools triggered the switch
-        lovelace_tools = tool_classes.select do |tool_class|
-          tool_name = tool_class.respond_to?(:definition) ? tool_class.definition[:name] : tool_class.to_s.demodulize.underscore
-          LlmToolkit::LovelaceModelSwitcher::CUA_BROWSER_TOOLS.include?(tool_name)
-        end
-        lovelace_tool_names = lovelace_tools.map { |tc| tc.respond_to?(:definition) ? tc.definition[:name] : tc.to_s.demodulize.underscore }
-        Rails.logger.info("   CUA browser tools: #{lovelace_tool_names.join(', ')}")
+      # Check if LovelaceCuaAssistant is among the tools (hybrid mode)
+      has_cua_assistant = tool_names.include?('lovelace_cua_assistant')
+      if has_cua_assistant
+        Rails.logger.info("🎯 Hybrid mode: LovelaceCuaAssistant available for browser automation when needed")
       end
 
-      # 🚨 FIX: Create initial status message instead of empty message
-      initial_content = if use_direct_cua
-        "🎯 Analyse automatique en cours..."
-      else
-        "🤔 Traitement de votre demande..."
-      end
+      # Use the original model - the assistant will call LovelaceCuaAssistant tool when it needs browser automation
+      final_llm_model = original_llm_model
+
+      # Create initial status message
+      initial_content = "🤔 Traitement de votre demande..."
 
       assistant_message = conversation.messages.create!(
         role: 'assistant',
-        content: initial_content, # ✅ Now has meaningful content
+        content: initial_content,
         user_id: user_id,
-        llm_model: use_direct_cua ? original_llm_model : final_llm_model
+        llm_model: final_llm_model
       )
 
       # Set up Thread.current[:current_user_id] for tools that need it
       Thread.current[:current_user_id] = user_id
 
-      # Choose the appropriate service based on model type
-      if use_direct_cua
-        Rails.logger.info("🎯 Using OpenAI CUA Streaming Service for computer-use-preview")
-        
-        # Use the specialized CUA service that calls OpenAI directly
-        service = LlmToolkit::OpenaiCuaStreamingService.new(
-          conversation: conversation,
-          assistant_message: assistant_message,
-          tool_classes: tool_classes,
-          user_id: user_id,
-          broadcast_to: broadcast_to
-        )
-      else
-        Rails.logger.info("🔄 Using standard streaming service with model: #{final_llm_model.name}")
-        
-        # Use the standard streaming service with the switched OpenAI model
-        service = LlmToolkit::CallStreamingLlmWithToolService.new(
-          llm_model: final_llm_model,
-          conversation: conversation,
-          assistant_message: assistant_message,
-          tool_classes: tool_classes,
-          user_id: user_id,
-          broadcast_to: broadcast_to
-        )
-      end
+      Rails.logger.info("🔄 Using standard streaming service with model: #{final_llm_model.name}")
+      Rails.logger.info("   Tools available: #{tool_names.length} tools")
+      
+      # Use the standard streaming service with all tools
+      # The model will call LovelaceCuaAssistant when it needs browser automation
+      service = LlmToolkit::CallStreamingLlmWithToolService.new(
+        llm_model: final_llm_model,
+        conversation: conversation,
+        assistant_message: assistant_message,
+        tool_classes: tool_classes,
+        user_id: user_id,
+        broadcast_to: broadcast_to
+      )
 
       # Process the streaming LLM call
       response = service.call
@@ -109,14 +78,8 @@ module LlmToolkit
       
       # Update the assistant message with error details
       if assistant_message
-        error_content = if use_direct_cua
-          "❌ Erreur avec l'automatisation CUA OpenAI: #{e.message}"
-        else
-          "Error processing your streaming request: #{e.message}"
-        end
-        
         assistant_message.update(
-          content: error_content,
+          content: "Error processing your streaming request: #{e.message}",
           is_error: true
         )
       end

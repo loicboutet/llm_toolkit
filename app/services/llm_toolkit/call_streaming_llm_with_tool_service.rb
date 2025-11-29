@@ -294,10 +294,26 @@ module LlmToolkit
         Rails.logger.error(error_message)
         Rails.logger.error(e.backtrace.join("\n"))
         
-        # Update message with error only if it's empty
-        if @current_message && @current_message.content.blank?
+        # Create user-friendly error message based on error type
+        friendly_message = case e.message
+        when /Status 413/i
+          "La conversation est devenue trop longue. Veuillez commencer une nouvelle conversation."
+        when /Status 400/i
+          "Une erreur de format s'est produite. Veuillez réessayer."
+        when /Status 429/i, /rate limit/i
+          "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
+        when /timeout/i
+          "La requête a pris trop de temps. Veuillez réessayer."
+        else
+          "Une erreur s'est produite: #{e.message.truncate(100)}"
+        end
+        
+        # Always update the message with the error (overwrite any partial content)
+        if @current_message
           @current_message.update(
-            content: "Sorry, an error occurred during follow-up: #{e.message.truncate(200)}"
+            content: friendly_message,
+            is_error: true,
+            finish_reason: 'error'
           )
         end
       end

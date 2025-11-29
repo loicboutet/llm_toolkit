@@ -18,17 +18,7 @@ module LlmToolkit
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
 
         # Fix the nested content structure for conversation history
-        fixed_conversation_history = Array(conversation_history).map do |msg|
-          # If content is an array of objects with 'type' and 'text' properties, convert to string
-          if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && item[:type] && item[:text] }
-            # Extract just the text from each content item
-            text_content = msg[:content].map { |item| item[:text] }.join("\n")
-            msg.merge(content: text_content)
-          else
-            # Keep as-is if already a string or other format
-            msg
-          end
-        end
+        fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
 
         # Combine system messages and conversation history
         messages = formatted_system_messages + fixed_conversation_history
@@ -113,17 +103,7 @@ module LlmToolkit
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
 
         # Fix the nested content structure for conversation history
-        fixed_conversation_history = Array(conversation_history).map do |msg|
-          # If content is an array of objects with 'type' and 'text' properties, convert to string
-          if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && item[:type] && item[:text] }
-            # Extract just the text from each content item
-            text_content = msg[:content].map { |item| item[:text] }.join("\n")
-            msg.merge(content: text_content)
-          else
-            # Keep as-is if already a string or other format
-            msg
-          end
-        end
+        fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
 
         # Combine system messages and conversation history
         messages = formatted_system_messages + fixed_conversation_history
@@ -215,6 +195,35 @@ module LlmToolkit
       end
       
       private
+      
+      # Fix conversation history for OpenRouter API compatibility
+      # - Converts array content to string for simple text messages
+      # - Ensures nil content becomes empty string (some models like o4-mini reject null)
+      # - Preserves tool_calls structure
+      def fix_conversation_history_for_openrouter(conversation_history)
+        Array(conversation_history).map do |msg|
+          fixed_msg = msg.dup
+          
+          # Handle content formatting
+          if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && item[:type] && item[:text] }
+            # Extract just the text from each content item
+            text_content = msg[:content].map { |item| item[:text] }.join("\n")
+            fixed_msg[:content] = text_content
+          elsif msg[:content].nil?
+            # CRITICAL FIX: Convert nil content to empty string
+            # Some models (o4-mini via OpenRouter) reject null content in assistant messages
+            fixed_msg[:content] = ""
+          end
+          
+          # Ensure tool_calls is preserved if present
+          # This handles assistant messages that have tool_calls
+          if msg[:tool_calls].present?
+            fixed_msg[:tool_calls] = msg[:tool_calls]
+          end
+          
+          fixed_msg
+        end
+      end
       
       # Sanitize request body for logging by removing large base64 content
       def sanitize_request_body_for_logging(request_body)

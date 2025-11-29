@@ -69,9 +69,10 @@ module LlmToolkit
     end
 
     # Finds the default LlmModel for this provider
+    # Returns the model with the lowest position
     # @return [LlmModel, nil] The default model or nil if none is set
     def default_llm_model
-      llm_models.default.first || llm_models.first
+      llm_models.ordered.first
     end
 
     private

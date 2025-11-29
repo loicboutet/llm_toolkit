@@ -4,20 +4,8 @@ module LlmToolkit
     has_many :messages, class_name: 'LlmToolkit::Message', dependent: :nullify
 
     validates :name, presence: true, uniqueness: { scope: :llm_provider_id }
-    validates :default, uniqueness: { scope: :llm_provider_id }, if: :default?
 
-    # Callback to ensure only one default is set per provider
-    before_save :ensure_single_default, if: :default?
-
-    scope :default, -> { where(default: true) }
-
-    private
-
-    def ensure_single_default
-      # Unset other defaults for the same provider
-      LlmModel.where(llm_provider_id: llm_provider_id)
-              .where.not(id: id)
-              .update_all(default: false)
-    end
+    # Scopes
+    scope :ordered, -> { order(position: :asc, id: :asc) }
   end
 end
