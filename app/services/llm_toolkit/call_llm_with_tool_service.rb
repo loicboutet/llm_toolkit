@@ -7,7 +7,7 @@ module LlmToolkit
     # @param llm_model [LlmModel] The model to use for LLM calls
     # @param conversation [Conversation] The conversation to update
     # @param tool_classes [Array<Class>] Optional tool classes to use
-    # @param role [Symbol] Role to use for conversation history
+    # @param role [Symbol] Role to use for conversation history (deprecated, not used)
     # @param user_id [Integer] ID of the user making the request
     def initialize(llm_model:, conversation:, tool_classes: [], role: nil, user_id: nil)
       @llm_model = llm_model
@@ -117,7 +117,8 @@ module LlmToolkit
                    end
 
       # Get conversation history, formatted for the specific model's provider type
-      conv_history = @conversation.history(@role, llm_model: @llm_model)
+      # Note: history method only takes llm_model: keyword argument
+      conv_history = @conversation.history(llm_model: @llm_model)
 
       # Call the LLM provider (Provider's call method will need refactoring later)
       # For now, it still uses settings/config, but we pass the context
@@ -211,7 +212,16 @@ module LlmToolkit
         return false
       end
 
-      # Handle asynchronous results
+      # Handle skip_tool_result flag (used by sub_agent tool)
+      # This means the tool has spawned an async process that will create the tool_result later
+      if result.is_a?(Hash) && result[:skip_tool_result]
+        Rails.logger.info("Tool #{tool_use.name} returned skip_tool_result - tool_result will be created later")
+        # Don't create a tool_result now
+        # The conversation is already in waiting status (set by the tool)
+        return true
+      end
+
+      # Handle asynchronous results (for other async tools that DO want a pending result)
       if result.is_a?(Hash) && result[:state] == "asynchronous_result"
         # For async tools, the tool_use is already in an approved state
         # but the tool_result will be updated later when the async response arrives

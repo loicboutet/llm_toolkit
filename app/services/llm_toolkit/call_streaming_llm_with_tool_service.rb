@@ -655,7 +655,16 @@ module LlmToolkit
           return false
         end
         
-        # Handle asynchronous results
+        # Handle skip_tool_result flag (used by sub_agent tool)
+        # This means the tool has spawned an async process that will create the tool_result later
+        if result.is_a?(Hash) && result[:skip_tool_result]
+          Rails.logger.info("Tool #{tool_use.name} returned skip_tool_result - tool_result will be created later")
+          # Don't create a tool_result now, don't set tool_results_pending
+          # The conversation is already in waiting status (set by the tool)
+          return true
+        end
+        
+        # Handle asynchronous results (for other async tools that DO want a pending result)
         if result.is_a?(Hash) && result[:state] == "asynchronous_result"
           # For async tools, the tool_use is already in an approved state
           # but the tool_result will be updated later when the async response arrives

@@ -379,7 +379,12 @@ module LlmToolkit
              end
           end
           
+          # Check if this is a screenshot tool result with image data
+          # If so, we need to extract the image and add it as a multimodal user message
+          image_data = extract_image_from_tool_result(tool_result_content, tool_use.name)
+          
           # Sanitize tool result content to prevent oversized payloads
+          # This will remove the base64 image data from the text content
           tool_result_content = sanitize_tool_result_content(tool_result_content, tool_use.name)
           
           # Ensure we never send empty content - provide a fallback message
@@ -393,12 +398,15 @@ module LlmToolkit
             name: tool_use.name,
             content: tool_result_content
           }
+          
+          # If we extracted an image, add a user message with the image as multimodal content
+          # This allows vision-capable models to actually SEE the screenshot
+          if image_data
+            Rails.logger.info("📸 Adding screenshot image to conversation for tool #{tool_use.name}")
+            tool_result_messages << create_image_user_message(image_data, tool_use.name)
+          end
         else
           # No tool_result exists - create a synthetic error result to maintain API compliance
-          # This happens when:
-          # - Tool execution fails or times out (e.g., Lovelace client timeout)
-          # - The conversation was interrupted before tool execution completed
-          # - The tool is still pending approval
           Rails.logger.warn("Tool use #{tool_use.id} (#{tool_use.name}) has no tool_result - creating synthetic error response for OpenRouter")
           
           error_message = case tool_use.status
@@ -427,6 +435,73 @@ module LlmToolkit
       messages
     end
 
+    # Extract base64 image data from tool result content if present
+    # Returns the base64 data URL or nil if no image found
+    def extract_image_from_tool_result(content, tool_name)
+      return nil if content.blank?
+      
+      content_str = content.to_s
+      
+      # Only extract images from screenshot-related tools
+      screenshot_tools = %w[
+        lovelace_browser_screenshot
+        lovelace_browser_get_state
+        lovelace_cua_assistant
+      ]
+      
+      return nil unless screenshot_tools.include?(tool_name)
+      
+      # Pattern 1: Ruby hash notation with :data key
+      # {:result=>{:type=>"image_base64", :data=>"iVBORw0KGgo..."}}
+      if match = content_str.match(/:data\s*=>\s*"([A-Za-z0-9+\/=]+)"/)
+        base64_data = match[1]
+        if base64_data.length > 100  # Sanity check - real images are much larger
+          Rails.logger.info("📸 Extracted image from Ruby hash notation (#{base64_data.length} chars)")
+          return "data:image/png;base64,#{base64_data}"
+        end
+      end
+      
+      # Pattern 2: JSON format with "data" key
+      # {"result":{"type":"image_base64","data":"iVBORw0KGgo..."}}
+      if match = content_str.match(/"data"\s*:\s*"([A-Za-z0-9+\/=]+)"/)
+        base64_data = match[1]
+        if base64_data.length > 100
+          Rails.logger.info("📸 Extracted image from JSON format (#{base64_data.length} chars)")
+          return "data:image/png;base64,#{base64_data}"
+        end
+      end
+      
+      # Pattern 3: Already a data URL
+      if match = content_str.match(/(data:image\/[a-z]+;base64,[A-Za-z0-9+\/=]+)/)
+        data_url = match[1]
+        if data_url.length > 100
+          Rails.logger.info("📸 Extracted existing data URL (#{data_url.length} chars)")
+          return data_url
+        end
+      end
+      
+      nil
+    end
+
+    # Create a user message with the screenshot image for multimodal models
+    def create_image_user_message(image_data_url, tool_name)
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "Voici la capture d'écran du navigateur suite à l'action #{tool_name}. Analyse cette image pour comprendre l'état actuel de la page."
+          },
+          {
+            type: "image_url",
+            image_url: {
+              url: image_data_url
+            }
+          }
+        ]
+      }
+    end
+
     # Sanitize tool result content to prevent oversized payloads (413 errors)
     # - Removes base64 image data and replaces with a summary
     # - Truncates overly long results
@@ -435,15 +510,16 @@ module LlmToolkit
       
       content_str = content.to_s
       
-      # Check for base64 image data patterns
+      # Check for base64 image data patterns - remove the large binary data
+      # The image will be sent separately as a multimodal message
       if content_str.include?('image_base64') || content_str.include?('data:image')
         # Extract the message part if it exists, remove the base64 data
         if content_str =~ /:message\s*=>\s*"([^"]+)"/
-          return "[Image captured successfully] #{$1}"
+          return "[Screenshot captured successfully] #{$1}"
         elsif content_str =~ /"message"\s*:\s*"([^"]+)"/
-          return "[Image captured successfully] #{$1}"
+          return "[Screenshot captured successfully] #{$1}"
         else
-          return "[Image captured successfully - screenshot taken]"
+          return "[Screenshot captured successfully - image sent separately for visual analysis]"
         end
       end
       
