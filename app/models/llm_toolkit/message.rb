@@ -14,29 +14,110 @@ module LlmToolkit
       "🎯 Analyse automatique en cours..."
     ].freeze
 
-    # Broadcast when assistant messages are created or updated
-    after_create_commit :broadcast_message_frame_update, if: :llm_content?
-    after_update_commit :broadcast_message_frame_update, if: -> { saved_change_to_content? }
-    # Broadcast usage stats update when tokens change
-    after_update_commit :broadcast_usage_stats_update, if: :saved_change_to_api_total_tokens?
+    # Throttle settings for streaming broadcasts
+    STREAMING_THROTTLE_MS = 50 # Minimum time between broadcasts during streaming (50ms = ~20 updates/sec)
+    
+    # Broadcast when assistant messages are created
+    # For new messages, replace the entire frame to handle grouping properly
+    after_create_commit :broadcast_message_created, if: :llm_content?
+    
+    # For content updates during streaming, only update the specific content element
+    # This is MUCH more efficient than replacing the entire conversation
+    after_update_commit :broadcast_content_update_throttled, if: -> { saved_change_to_content? && llm_content? }
+    
+    # When tokens are updated (message complete), broadcast full frame and header stats
+    after_update_commit :broadcast_message_complete, if: -> { saved_change_to_prompt_tokens? && llm_content? }
 
-    # Replace the entire message frame to handle grouping properly
-    # Uses broadcast_replace_to (synchronous) because locals with AR relations can't be serialized for later
-    def broadcast_message_frame_update
-      # Get all messages for this conversation as an array to avoid serialization issues
+    # When a NEW message is created, we need to replace the entire frame
+    # to properly handle message grouping
+    def broadcast_message_created
+      Rails.logger.info("[BROADCAST] Message #{id} created, broadcasting full frame replacement")
+      
+      broadcast_full_frame
+    rescue => e
+      Rails.logger.error("Error broadcasting message created: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
+    end
+    
+    # When message is complete (has tokens), broadcast full frame and header stats
+    def broadcast_message_complete
+      Rails.logger.info("[BROADCAST] Message #{id} complete (tokens: #{prompt_tokens}), broadcasting full frame and header stats")
+      
+      broadcast_full_frame
+      broadcast_header_stats
+    rescue => e
+      Rails.logger.error("Error broadcasting message complete: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
+    end
+    
+    # Broadcast the full conversation messages frame
+    def broadcast_full_frame
       all_messages = conversation.messages
                                   .includes(tool_uses: :tool_result, attachments_attachments: :blob)
                                   .order(created_at: :asc)
                                   .to_a
 
       broadcast_replace_to(
-        conversation,                              # Stream name derived from the conversation
-        target: "conversation_messages_frame",     # Target the turbo frame
+        conversation,
+        target: "conversation_messages_frame",
         partial: "conversations/conversation_messages_frame",
         locals: { messages: all_messages }
       )
+    end
+    
+    # Broadcast header stats update
+    def broadcast_header_stats
+      broadcast_replace_to(
+        conversation,
+        target: dom_id(conversation, :header_stats),
+        partial: "conversations/header_stats",
+        locals: { conversation: conversation }
+      )
     rescue => e
-      Rails.logger.error("Error broadcasting message frame update: #{e.message}")
+      Rails.logger.error("Error broadcasting header stats: #{e.message}")
+    end
+    
+    # Throttled content update to prevent overwhelming the browser during streaming
+    def broadcast_content_update_throttled
+      # Check if content is placeholder - if so, don't broadcast content update
+      # The create broadcast already handles showing the thinking state
+      return if placeholder_content?
+      
+      # Use a simple time-based throttle via instance variable on Thread.current
+      throttle_key = "message_broadcast_#{id}"
+      last_broadcast = Thread.current[throttle_key]
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000 # milliseconds
+      
+      if last_broadcast && (now - last_broadcast) < STREAMING_THROTTLE_MS
+        # Skip this broadcast, too soon
+        return
+      end
+      
+      Thread.current[throttle_key] = now
+      
+      broadcast_content_update
+    end
+    
+    # For content UPDATES during streaming, only update the specific content element
+    # This prevents re-rendering the entire conversation on every token
+    def broadcast_content_update
+      # Render the markdown content using the helper
+      rendered_content = render_markdown(content || "")
+      
+      target_id = "content_message_#{id}"
+      
+      Rails.logger.debug("[BROADCAST] Updating content for message #{id}, target: #{target_id}")
+      
+      # Use replace_to to replace the entire div (including the thinking animation)
+      # This is more reliable than update which just changes innerHTML
+      Turbo::StreamsChannel.broadcast_replace_to(
+        conversation,
+        target: target_id,
+        html: "<div id=\"#{target_id}\" class=\"prose-nexrai\">#{rendered_content}</div>"
+      )
+    rescue => e
+      Rails.logger.error("Error broadcasting content update for message #{id}: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
     end
     
     # Attachments for user uploads (images, PDFs)
@@ -63,17 +144,34 @@ module LlmToolkit
       !placeholder_content?
     end
     
+    # Render markdown content - used for broadcasting
+    def render_markdown(text)
+      return '' if text.blank?
+      
+      renderer = Redcarpet::Render::HTML.new(
+        filter_html: false,
+        hard_wrap: true,
+        link_attributes: { target: '_blank', rel: 'noopener noreferrer' }
+      )
+      markdown = Redcarpet::Markdown.new(
+        renderer,
+        autolink: true,
+        tables: true,
+        fenced_code_blocks: true,
+        strikethrough: true,
+        superscript: true,
+        underline: true,
+        highlight: true,
+        quote: true,
+        footnotes: true,
+        lax_spacing: true
+      )
+      
+      markdown.render(text).html_safe
+    end
+    
     # =====================================================
     # REASONING SUPPORT (OpenRouter compatible)
-    # =====================================================
-    # OpenRouter returns reasoning in `reasoning_details` array with types:
-    # - reasoning.summary: High-level summary
-    # - reasoning.encrypted: Encrypted/redacted reasoning
-    # - reasoning.text: Raw text reasoning with optional signature
-    #
-    # We store:
-    # - reasoning_content: Human-readable reasoning text (for display)
-    # - reasoning_details: Full OpenRouter format array (for API calls)
     # =====================================================
     
     # Check if message has reasoning data
@@ -82,7 +180,6 @@ module LlmToolkit
     end
     
     # Get displayable reasoning text
-    # Extracts text from reasoning_details if reasoning_content is not set
     def displayable_reasoning
       return reasoning_content if reasoning_content.present?
       return nil if reasoning_details.blank?
@@ -91,7 +188,6 @@ module LlmToolkit
     end
     
     # Set reasoning from OpenRouter response format
-    # @param details [Array] Array of reasoning_details objects from OpenRouter
     def set_reasoning_from_openrouter(details)
       return if details.blank?
       
@@ -100,11 +196,9 @@ module LlmToolkit
     end
     
     # Set reasoning from OpenAI CUA format
-    # @param reasoning_items [Array] Array of reasoning items from OpenAI CUA
     def set_reasoning_from_openai_cua(reasoning_items)
       return if reasoning_items.blank?
       
-      # Convert OpenAI CUA format to OpenRouter-compatible format
       converted_details = reasoning_items.map.with_index do |item, index|
         text = extract_openai_cua_reasoning_text(item)
         next nil if text.blank?
@@ -123,7 +217,6 @@ module LlmToolkit
     end
     
     # Build reasoning for API call (OpenRouter format)
-    # Used when passing assistant messages back in conversation history
     def reasoning_for_api
       return nil unless reasoning_details.present?
       reasoning_details
@@ -133,7 +226,6 @@ module LlmToolkit
     def for_llm_with_reasoning(llm_role = :coder, provider_type = "anthropic")
       base = for_llm(llm_role, provider_type)
       
-      # Add reasoning_details for assistant messages when using OpenRouter
       if role == 'assistant' && reasoning_details.present? && provider_type == "openrouter"
         base[:reasoning_details] = reasoning_details
       end
@@ -179,9 +271,20 @@ module LlmToolkit
       pricing = llm_model&.model_pricing
       
       if pricing
-        # Use the model's pricing from ModelPricing
         prompt_cost = (prompt_tokens.to_i * pricing.prompt_price_per_million_tokens.to_f) / 1_000_000
         completion_cost = (completion_tokens.to_i * pricing.completion_price_per_million_tokens.to_f) / 1_000_000
+        
+        # Add cache cost calculations if cache pricing exists
+        if pricing.respond_to?(:cache_read_price_per_million_tokens) && cache_read_input_tokens.to_i > 0
+          cache_read_cost = (cache_read_input_tokens.to_i * pricing.cache_read_price_per_million_tokens.to_f) / 1_000_000
+          prompt_cost += cache_read_cost
+        end
+        
+        if pricing.respond_to?(:cache_creation_price_per_million_tokens) && cache_creation_input_tokens.to_i > 0
+          cache_creation_cost = (cache_creation_input_tokens.to_i * pricing.cache_creation_price_per_million_tokens.to_f) / 1_000_000
+          prompt_cost += cache_creation_cost
+        end
+        
         prompt_cost + completion_cost
       else
         # Fallback to hardcoded rates (Claude-like pricing)
@@ -195,7 +298,18 @@ module LlmToolkit
     # Check if we have cost data to display
     def has_cost_data?
       prompt_tokens.to_i > 0 || completion_tokens.to_i > 0 || 
-        input_tokens.to_i > 0 || output_tokens.to_i > 0
+        input_tokens.to_i > 0 || output_tokens.to_i > 0 ||
+        cache_creation_input_tokens.to_i > 0 || cache_read_input_tokens.to_i > 0
+    end
+    
+    # Get cache statistics for this message
+    def cache_stats
+      {
+        cache_creation_tokens: cache_creation_input_tokens.to_i,
+        cache_read_tokens: cache_read_input_tokens.to_i,
+        has_cache: cache_creation_input_tokens.to_i > 0 || cache_read_input_tokens.to_i > 0,
+        cache_hit_rate: prompt_tokens.to_i > 0 ? ((cache_read_input_tokens.to_f / prompt_tokens) * 100).round(1) : 0
+      }
     end
     
     # For backward compatibility - returns false if ActiveStorage isn't available
@@ -246,9 +360,7 @@ module LlmToolkit
     
     # Extract text from OpenAI CUA reasoning item
     def extract_openai_cua_reasoning_text(item)
-      # OpenAI CUA reasoning items can have different structures
       if item['summary'].is_a?(Array)
-        # New format: summary is array of objects with type/text
         item['summary'].map { |s| s['text'] if s['type'] == 'summary_text' }.compact.join("\n")
       elsif item['summary'].is_a?(String)
         item['summary']
@@ -259,18 +371,6 @@ module LlmToolkit
       else
         nil
       end
-    end
-    
-    # Broadcasts an update to the conversation's usage stats frame
-    def broadcast_usage_stats_update
-      broadcast_replace_to(
-        conversation,
-        target: dom_id(conversation, "usage_stats"), # Target the turbo frame
-        partial: "conversations/usage_stats",
-        locals: { conversation: conversation }
-      )
-    rescue => e
-      Rails.logger.error("Error broadcasting usage stats update: #{e.message}")
     end
 
     def deduplicate_images
