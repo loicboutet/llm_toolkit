@@ -18,7 +18,7 @@ module LlmToolkit
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
 
         # Fix the nested content structure for conversation history
-        # This also applies cache_control to the last message
+        # This also applies cache_control to the last non-tool message
         fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
 
         # Combine system messages and conversation history
@@ -105,7 +105,7 @@ module LlmToolkit
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
 
         # Fix the nested content structure for conversation history
-        # This also applies cache_control to the last message
+        # This also applies cache_control to the last non-tool message
         fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
 
         # Combine system messages and conversation history
@@ -162,7 +162,8 @@ module LlmToolkit
           content_complete: false,
           finish_reason: nil,
           json_buffer: "",
-          generation_id: nil  # Track generation ID for cache stats
+          generation_id: nil,  # Track generation ID for cache stats
+          api_error: nil       # Track API errors from streaming
         }
 
         response = client.post('chat/completions') do |req|
@@ -182,8 +183,9 @@ module LlmToolkit
         
         # Verify response code and return final result
         unless (200..299).cover?(response.status)
-          Rails.logger.error("OpenRouter API streaming error: Status #{response.status}")
-          raise ApiError, "API streaming error: Status #{response.status}"
+          error_detail = streaming_state[:api_error] || "Status #{response.status}"
+          Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
+          raise ApiError, "API streaming error: #{error_detail}"
         end
         
         # Format the final result
@@ -258,29 +260,50 @@ module LlmToolkit
       
       # Fix conversation history for OpenRouter API compatibility
       # - Converts array content to string for simple text messages
-      # - Applies cache_control ONLY to the LAST message (regardless of size)
+      # - Applies cache_control ONLY to the LAST user/assistant message (NOT tool messages)
       # - Ensures nil content becomes empty string (some models like o4-mini reject null)
       # - Preserves tool_calls structure
       #
+      # IMPORTANT: Tool messages MUST have string content, not array content.
+      # The Anthropic API (via OpenRouter) rejects tool messages with array content.
+      #
       # Note: Anthropic limits to 4 cache_control blocks max. System messages use 1,
-      # so we only apply 1 cache_control in conversation (to the last message).
+      # so we only apply 1 cache_control in conversation (to the last cacheable message).
       def fix_conversation_history_for_openrouter(conversation_history)
         messages = Array(conversation_history)
         return [] if messages.empty?
         
-        last_index = messages.length - 1
+        # Find the last message that CAN have cache_control applied
+        # Tool messages cannot have array content, so skip them for caching
+        last_cacheable_index = messages.rindex { |msg| msg[:role] != 'tool' }
         
         messages.each_with_index.map do |msg, index|
           fixed_msg = msg.dup
-          is_last_message = (index == last_index)
+          is_last_cacheable = (index == last_cacheable_index)
+          is_tool_message = (msg[:role] == 'tool')
           
-          # Handle content formatting based on type
-          if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && item[:type] && item[:text] }
+          # CRITICAL: Tool messages must ALWAYS have string content
+          # Never convert tool message content to array format
+          if is_tool_message
+            # Ensure tool message content is a string
+            if msg[:content].is_a?(Array)
+              # Extract text from array format
+              text_content = msg[:content].map { |item| item[:text] || item['text'] }.compact.join("\n")
+              fixed_msg[:content] = text_content
+            elsif msg[:content].nil?
+              fixed_msg[:content] = ""
+            end
+            # String content stays as-is for tool messages
+            next fixed_msg
+          end
+          
+          # Handle content formatting for non-tool messages (user/assistant)
+          if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && (item[:type] || item['type']) && (item[:text] || item['text']) }
             # Content is already in array format - extract text
-            text_content = msg[:content].map { |item| item[:text] }.join("\n")
+            text_content = msg[:content].map { |item| item[:text] || item['text'] }.join("\n")
             
-            # Apply cache_control only to the last message
-            if is_last_message && conversation_caching_enabled?
+            # Apply cache_control only to the last cacheable message
+            if is_last_cacheable && conversation_caching_enabled?
               fixed_msg[:content] = [
                 { type: 'text', text: text_content, cache_control: { type: 'ephemeral' } }
               ]
@@ -293,8 +316,8 @@ module LlmToolkit
             # Some models (o4-mini via OpenRouter) reject null content in assistant messages
             fixed_msg[:content] = ""
           elsif msg[:content].is_a?(String)
-            # String content - apply cache_control only to the last message
-            if is_last_message && conversation_caching_enabled?
+            # String content - apply cache_control only to the last cacheable message
+            if is_last_cacheable && conversation_caching_enabled?
               fixed_msg[:content] = [
                 { type: 'text', text: msg[:content], cache_control: { type: 'ephemeral' } }
               ]
@@ -372,7 +395,7 @@ module LlmToolkit
         remaining = streaming_state[:json_buffer].strip
         return if remaining.empty?
         
-        Rails.logger.debug("Processing remaining buffer: #{remaining[0..200]}...")
+        Rails.logger.info("Processing remaining buffer: #{remaining[0..500]}...")
         
         # Process any remaining lines
         remaining.split("\n").each do |line|
@@ -404,24 +427,43 @@ module LlmToolkit
           json_data = JSON.parse(json_str)
           Rails.logger.debug("OpenRouter chunk: #{json_data.inspect}")
 
-          # Check if this chunk contains an error - SIMPLE ERROR HANDLING
+          # Check if this chunk contains an error - IMPROVED ERROR HANDLING
           if json_data['error'].present?
-            error_message = json_data['error']['message']
+            error_obj = json_data['error']
+            error_message = error_obj['message'] || error_obj.to_s
+            error_code = error_obj['code']
             
-            # Create user-friendly message for common errors
-            friendly_message = case error_message
-            when /no endpoints found that support tool use/i
-              "Le modèle sélectionné ne prend pas en charge les outils avancés."
-            when /rate limit/i, /too many requests/i
-              "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
-            when /model .* not found/i
-              "Le modèle demandé n'est pas disponible. Essayez de sélectionner un autre modèle."
-            else
-              "Une erreur s'est produite: #{error_message}"
+            # Extract more detailed error info if available (nested errors from providers)
+            if error_obj['metadata'].is_a?(Hash)
+              raw_error = error_obj['metadata']['raw']
+              if raw_error.present?
+                # Try to parse the raw error for more details
+                begin
+                  raw_parsed = JSON.parse(raw_error.to_s)
+                  if raw_parsed.dig('error', 'message')
+                    error_message = raw_parsed['error']['message']
+                  end
+                rescue JSON::ParserError
+                  # Keep original message if raw can't be parsed
+                end
+              end
             end
             
-            # Yield an error chunk
-            yield({ chunk_type: 'error', error_message: friendly_message }) if block_given?
+            Rails.logger.error("[OPENROUTER API ERROR] Code: #{error_code}, Message: #{error_message}")
+            
+            # Store the error for later (in case we need to raise it)
+            streaming_state[:api_error] = error_message
+            
+            # Create user-friendly message for common errors
+            friendly_message = translate_api_error_to_friendly_message(error_message, error_code)
+            
+            # Yield an error chunk with BOTH the friendly message AND the raw error
+            yield({ 
+              chunk_type: 'error', 
+              error_message: friendly_message,
+              raw_error: error_message,
+              error_code: error_code
+            }) if block_given?
             return
           end
 
@@ -429,8 +471,41 @@ module LlmToolkit
           process_streaming_response_chunk(json_data, streaming_state, &block)
           
         rescue JSON::ParserError => e
-          Rails.logger.error("Failed to parse streaming chunk: #{e.message}, chunk: #{json_str}")
+          Rails.logger.error("Failed to parse streaming chunk: #{e.message}, chunk: #{json_str[0..200]}...")
           # Don't re-raise, just log and continue - this is common with incomplete chunks
+        end
+      end
+      
+      # Translate API error messages to user-friendly French messages
+      # Also preserves technical details for debugging
+      def translate_api_error_to_friendly_message(error_message, error_code = nil)
+        case error_message
+        when /no endpoints found that support tool use/i
+          "Le modèle sélectionné ne prend pas en charge les outils avancés."
+        when /rate limit/i, /too many requests/i
+          "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
+        when /model .* not found/i
+          "Le modèle demandé n'est pas disponible. Essayez de sélectionner un autre modèle."
+        when /tool_use.*without.*tool_result/i, /tool_result.*tool_use_id/i
+          "Erreur de synchronisation des outils. Veuillez réessayer ou démarrer une nouvelle conversation."
+        when /invalid_request_error/i
+          # Extract specific Anthropic error details
+          if error_message =~ /messages\.\d+\.content/
+            "Format de message invalide. Veuillez réessayer ou démarrer une nouvelle conversation."
+          else
+            "Requête invalide: #{error_message.truncate(150)}"
+          end
+        when /context.*too long/i, /maximum context length/i
+          "La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
+        when /content.*filter/i, /safety/i
+          "Le contenu a été filtré pour des raisons de sécurité."
+        when /timeout/i
+          "La requête a pris trop de temps. Veuillez réessayer."
+        when /authentication/i, /unauthorized/i, /api.?key/i
+          "Erreur d'authentification avec le service. Veuillez contacter l'administrateur."
+        else
+          # Default: show truncated error message
+          "Erreur API: #{error_message.truncate(200)}"
         end
       end
       
