@@ -12,7 +12,7 @@ LlmToolkit.configure do |config|
   config.default_anthropic_model = "claude-3-7-sonnet-20250219"
   
   # Default maximum tokens to generate in responses
-  config.default_max_tokens = 8192
+  #config.default_max_tokens = 8192
   
   # Referer URL for OpenRouter API calls
   config.referer_url = "http://localhost:3000"

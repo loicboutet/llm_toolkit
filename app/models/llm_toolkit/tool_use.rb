@@ -3,6 +3,10 @@ module LlmToolkit
     belongs_to :message, class_name: 'LlmToolkit::Message'
     has_one :tool_result, class_name: 'LlmToolkit::ToolResult', dependent: :destroy
     
+    # The sub-agent conversation spawned by this tool_use (if it's a sub_agent tool)
+    # Uses spawning_tool_use_id on Conversation for the reverse lookup
+    has_one :spawned_conversation, class_name: 'LlmToolkit::Conversation', foreign_key: :spawning_tool_use_id
+    
     # Explicitly declare the attribute type
     attribute :status, :integer
     enum :status, { pending: 0, approved: 1, rejected: 2, waiting: 3 }, prefix: true
@@ -21,6 +25,11 @@ module LlmToolkit
 
     def completed?
       !status_pending? && !status_waiting?
+    end
+    
+    # Check if this tool_use spawned a sub-agent conversation
+    def spawned_sub_agent?
+      name == 'sub_agent' && spawned_conversation.present?
     end
     
     def file_content

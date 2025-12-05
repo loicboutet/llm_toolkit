@@ -18,6 +18,7 @@ module LlmToolkit
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
 
         # Fix the nested content structure for conversation history
+        # This also applies cache_control to the last message
         fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
 
         # Combine system messages and conversation history
@@ -33,7 +34,7 @@ module LlmToolkit
           model: model_name,
           messages: messages,
           stream: false,
-          max_tokens: max_tokens,
+        #  max_tokens: max_tokens,
           usage: { include: true }
         }
 
@@ -53,10 +54,14 @@ module LlmToolkit
             if content[:type] == 'file'
               Rails.logger.info("  Content #{content_idx + 1}: file (#{content[:file][:filename]})")
             else
-              Rails.logger.info("  Content #{content_idx + 1}: #{content[:type]} (#{content[:text]&.length || 0} chars)")
+              has_cache = content[:cache_control].present? ? " [CACHED]" : ""
+              Rails.logger.info("  Content #{content_idx + 1}: #{content[:type]} (#{content[:text]&.length || 0} chars)#{has_cache}")
             end
           end
         end
+        
+        # Log conversation history caching info
+        log_conversation_caching_info(fixed_conversation_history)
         
         # Detailed request logging
         if Rails.env.development?
@@ -100,6 +105,7 @@ module LlmToolkit
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
 
         # Fix the nested content structure for conversation history
+        # This also applies cache_control to the last message
         fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
 
         # Combine system messages and conversation history
@@ -125,17 +131,21 @@ module LlmToolkit
         Rails.logger.info("OpenRouter Streaming Request - System messages: #{formatted_system_messages.size}")
         Rails.logger.info("OpenRouter Streaming Request - Tools count: #{request_body[:tools]&.size || 0}")
         
-        # Log system message structure for debugging
+        # Log system message structure for debugging (including cache info)
         formatted_system_messages.each_with_index do |msg, idx|
           Rails.logger.info("System message #{idx + 1}: #{msg[:content].size} content parts")
           msg[:content].each_with_index do |content, content_idx|
             if content[:type] == 'file'
               Rails.logger.info("  Content #{content_idx + 1}: file (#{content[:file][:filename]})")
             else
-              Rails.logger.info("  Content #{content_idx + 1}: #{content[:type]} (#{content[:text]&.length || 0} chars)")
+              has_cache = content[:cache_control].present? ? " [CACHE_CONTROL: ephemeral]" : ""
+              Rails.logger.info("  Content #{content_idx + 1}: #{content[:type]} (#{content[:text]&.length || 0} chars)#{has_cache}")
             end
           end
         end
+        
+        # Log conversation history caching info
+        log_conversation_caching_info(fixed_conversation_history)
         
         # Detailed request logging
         if Rails.env.development?
@@ -151,7 +161,8 @@ module LlmToolkit
           usage_info: nil,
           content_complete: false,
           finish_reason: nil,
-          json_buffer: ""
+          json_buffer: "",
+          generation_id: nil  # Track generation ID for cache stats
         }
 
         response = client.post('chat/completions') do |req|
@@ -178,8 +189,8 @@ module LlmToolkit
         # Format the final result
         formatted_tool_calls = format_tools_response_from_openrouter(streaming_state[:tool_calls]) if streaming_state[:tool_calls].any?
         
-        # Log final usage info for debugging
-        Rails.logger.info("STREAMING COMPLETE - Final usage_info: #{streaming_state[:usage_info].inspect}")
+        # Log final usage info for debugging (including cache stats)
+        log_final_usage_stats(streaming_state)
         
         # Return the complete response object
         {
@@ -190,7 +201,8 @@ module LlmToolkit
           'stop_sequence' => nil,
           'tool_calls' => formatted_tool_calls || [],
           'usage' => streaming_state[:usage_info],
-          'finish_reason' => streaming_state[:finish_reason]
+          'finish_reason' => streaming_state[:finish_reason],
+          'generation_id' => streaming_state[:generation_id]
         }
       rescue Faraday::Error => e
         Rails.logger.error("OpenRouter API streaming error: #{e.message}")
@@ -199,23 +211,96 @@ module LlmToolkit
       
       private
       
+      # Log final usage statistics including cache information
+      def log_final_usage_stats(streaming_state)
+        usage = streaming_state[:usage_info]
+        
+        Rails.logger.info("STREAMING COMPLETE - Final usage_info: #{usage.inspect}")
+        
+        return unless usage
+        
+        # Log cache-specific stats if present
+        cache_info = extract_cache_info_from_usage(usage)
+        
+        if cache_info[:has_cache_data]
+          Rails.logger.info("[OPENROUTER CACHE] Streaming response cache stats:")
+          Rails.logger.info("  - Cache creation tokens: #{cache_info[:creation]}")
+          Rails.logger.info("  - Cache read tokens: #{cache_info[:read]}")
+          
+          prompt_tokens = usage['prompt_tokens'].to_i
+          if prompt_tokens > 0 && cache_info[:read] > 0
+            hit_rate = ((cache_info[:read].to_f / prompt_tokens) * 100).round(1)
+            Rails.logger.info("  - Cache hit rate: #{hit_rate}%")
+          end
+        end
+      end
+      
+      # Log caching information for conversation history messages
+      def log_conversation_caching_info(conversation_history)
+        cached_count = 0
+        total_cached_chars = 0
+        
+        conversation_history.each do |msg|
+          next unless msg[:content].is_a?(Array)
+          
+          msg[:content].each do |content_item|
+            if content_item[:cache_control].present?
+              cached_count += 1
+              total_cached_chars += content_item[:text]&.length.to_i
+            end
+          end
+        end
+        
+        if cached_count > 0
+          Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to #{cached_count} message(s) (#{total_cached_chars} total chars)")
+        end
+      end
+      
       # Fix conversation history for OpenRouter API compatibility
       # - Converts array content to string for simple text messages
+      # - Applies cache_control ONLY to the LAST message (regardless of size)
       # - Ensures nil content becomes empty string (some models like o4-mini reject null)
       # - Preserves tool_calls structure
+      #
+      # Note: Anthropic limits to 4 cache_control blocks max. System messages use 1,
+      # so we only apply 1 cache_control in conversation (to the last message).
       def fix_conversation_history_for_openrouter(conversation_history)
-        Array(conversation_history).map do |msg|
+        messages = Array(conversation_history)
+        return [] if messages.empty?
+        
+        last_index = messages.length - 1
+        
+        messages.each_with_index.map do |msg, index|
           fixed_msg = msg.dup
+          is_last_message = (index == last_index)
           
-          # Handle content formatting
+          # Handle content formatting based on type
           if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && item[:type] && item[:text] }
-            # Extract just the text from each content item
+            # Content is already in array format - extract text
             text_content = msg[:content].map { |item| item[:text] }.join("\n")
-            fixed_msg[:content] = text_content
+            
+            # Apply cache_control only to the last message
+            if is_last_message && conversation_caching_enabled?
+              fixed_msg[:content] = [
+                { type: 'text', text: text_content, cache_control: { type: 'ephemeral' } }
+              ]
+              Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to last message (#{msg[:role]}, #{text_content.length} chars)")
+            else
+              fixed_msg[:content] = text_content
+            end
           elsif msg[:content].nil?
             # CRITICAL FIX: Convert nil content to empty string
             # Some models (o4-mini via OpenRouter) reject null content in assistant messages
             fixed_msg[:content] = ""
+          elsif msg[:content].is_a?(String)
+            # String content - apply cache_control only to the last message
+            if is_last_message && conversation_caching_enabled?
+              fixed_msg[:content] = [
+                { type: 'text', text: msg[:content], cache_control: { type: 'ephemeral' } }
+              ]
+              Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to last message (#{msg[:role]}, #{msg[:content].length} chars)")
+            end
+            # Otherwise keep as string (no change needed)
           end
           
           # Ensure tool_calls is preserved if present
@@ -226,6 +311,12 @@ module LlmToolkit
           
           fixed_msg
         end
+      end
+      
+      # Check if conversation caching is enabled
+      # Uses the same setting as system message caching
+      def conversation_caching_enabled?
+        LlmToolkit.config.enable_prompt_caching
       end
       
       # Sanitize request body for logging by removing large base64 content
@@ -241,6 +332,16 @@ module LlmToolkit
               file_data = content_item[:file][:file_data]
               if file_data.length > 100
                 content_item[:file][:file_data] = "#{file_data[0..50]}... [TRUNCATED #{file_data.length} chars]"
+              end
+            end
+            
+            # Also truncate large text content for logging
+            if content_item[:type] == 'text' && content_item[:text]&.length.to_i > 500
+              original_length = content_item[:text].length
+              content_item[:text] = "#{content_item[:text][0..200]}... [TRUNCATED #{original_length} chars]"
+              # Preserve cache_control info in log
+              if content_item[:cache_control]
+                content_item[:text] += " [HAS CACHE_CONTROL]"
               end
             end
           end
@@ -363,11 +464,26 @@ module LlmToolkit
         # Record model name if not yet set
         streaming_state[:model_name] ||= json_data['model']
         
+        # Capture generation ID for potential cache stats lookup
+        streaming_state[:generation_id] ||= json_data['id']
+        
         # IMPORTANT: Capture usage data FIRST, before checking choices
         # OpenRouter sends usage in a separate final chunk with empty choices array:
         # {"id":"gen-xxx","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
+        #
+        # For cached requests, usage may also include:
+        # - cache_creation_input_tokens: tokens written to cache
+        # - cache_read_input_tokens: tokens read from cache (discounted)
         if json_data['usage'].present?
           streaming_state[:usage_info] = json_data['usage']
+          
+          # Log cache tokens if present
+          cache_info = extract_cache_info_from_usage(json_data['usage'])
+          if cache_info[:has_cache_data]
+            Rails.logger.info("[OPENROUTER STREAM] Cache data received: " \
+                              "creation=#{cache_info[:creation]}, read=#{cache_info[:read]}")
+          end
+          
           Rails.logger.info("CAPTURED USAGE DATA: #{json_data['usage'].inspect}")
         end
         
@@ -403,6 +519,37 @@ module LlmToolkit
           # If we have a non-nil finish reason, the response is complete
           yield({ chunk_type: 'finish', finish_reason: streaming_state[:finish_reason] }) if block_given?
         end
+      end
+      
+      # Extract cache information from usage data
+      # Handles multiple formats from different providers via OpenRouter
+      # @param usage [Hash] The usage data from OpenRouter
+      # @return [Hash] Cache information with :creation, :read, :has_cache_data keys
+      def extract_cache_info_from_usage(usage)
+        return { creation: 0, read: 0, has_cache_data: false } unless usage
+        
+        creation = 0
+        read = 0
+        
+        # OpenRouter/Anthropic format (most common)
+        creation = usage['cache_creation_input_tokens'].to_i if usage['cache_creation_input_tokens']
+        creation = usage['cache_write_input_tokens'].to_i if creation == 0 && usage['cache_write_input_tokens']
+        
+        read = usage['cache_read_input_tokens'].to_i if usage['cache_read_input_tokens']
+        read = usage['cached_tokens'].to_i if read == 0 && usage['cached_tokens']
+        
+        # Some providers use prompt_tokens_details (nested format)
+        if usage['prompt_tokens_details'].is_a?(Hash)
+          details = usage['prompt_tokens_details']
+          creation = details['cached_tokens_creation'].to_i if creation == 0 && details['cached_tokens_creation']
+          read = details['cached_tokens'].to_i if read == 0 && details['cached_tokens']
+        end
+        
+        {
+          creation: creation,
+          read: read,
+          has_cache_data: creation > 0 || read > 0
+        }
       end
       
       # Process tool calls from streaming response

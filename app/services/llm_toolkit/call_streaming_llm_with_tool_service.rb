@@ -5,7 +5,7 @@ module LlmToolkit
   class CallStreamingLlmWithToolService
     # Rendering helpers removed - broadcasting raw chunks
     
-    # Placeholder markers to detect and clear initial "thinking" messages
+    # Placeholder markers to detect "thinking" messages
     PLACEHOLDER_MARKERS = [
       "🤔 Traitement de votre demande...",
       "🎯 Analyse automatique en cours..."
@@ -186,6 +186,12 @@ module LlmToolkit
     end
 
     # Update message with usage data from the API response
+    # Supports both standard OpenRouter usage format and cache-related tokens
+    # 
+    # OpenRouter returns cache tokens in different formats depending on the provider:
+    # - Anthropic Claude: cache_creation_input_tokens, cache_read_input_tokens
+    # - Some models: native_tokens_cached (via generation endpoint)
+    #
     # @param response [Hash] The API response containing usage data
     # @param message [Message] The message to update
     def update_message_usage_from_response(response, message)
@@ -193,19 +199,116 @@ module LlmToolkit
       
       usage = response['usage']
       
-      # Log what we received for debugging
-      Rails.logger.info("update_message_usage_from_response - response['usage']: #{usage.inspect}")
+      # Log raw response for debugging cache data
+      Rails.logger.debug("[CACHE DEBUG] Raw response keys: #{response.keys.inspect}")
+      Rails.logger.debug("[CACHE DEBUG] Usage data: #{usage.inspect}")
       
       return unless usage
       
-      # Log usage data for debugging
-      Rails.logger.info("Updating message #{message.id} with usage: prompt_tokens=#{usage['prompt_tokens']}, completion_tokens=#{usage['completion_tokens']}, total_tokens=#{usage['total_tokens']}")
-      
-      message.update(
+      # Build update hash with standard tokens
+      update_data = {
         prompt_tokens: usage['prompt_tokens'].to_i,
         completion_tokens: usage['completion_tokens'].to_i,
         api_total_tokens: usage['total_tokens'].to_i
-      )
+      }
+      
+      # === CACHE TOKEN EXTRACTION ===
+      # OpenRouter can return cache tokens in multiple formats
+      cache_creation = extract_cache_creation_tokens(usage)
+      cache_read = extract_cache_read_tokens(usage)
+      
+      if cache_creation > 0
+        update_data[:cache_creation_input_tokens] = cache_creation
+      end
+      
+      if cache_read > 0
+        update_data[:cache_read_input_tokens] = cache_read
+      end
+      
+      # Update the message record
+      message.update(update_data)
+      
+      # Log comprehensive usage summary
+      log_usage_summary(message.id, update_data, cache_creation, cache_read, response)
+    end
+    
+    # Extract cache creation tokens from various response formats
+    # @param usage [Hash] The usage data from the response
+    # @return [Integer] Number of cache creation tokens
+    def extract_cache_creation_tokens(usage)
+      return 0 unless usage
+      
+      # Try different field names used by OpenRouter/providers
+      cache_creation = usage['cache_creation_input_tokens'] ||
+                       usage['cache_write_input_tokens'] ||
+                       usage['prompt_tokens_details']&.dig('cached_tokens_creation') ||
+                       0
+      
+      cache_creation.to_i
+    end
+    
+    # Extract cache read tokens from various response formats
+    # @param usage [Hash] The usage data from the response
+    # @return [Integer] Number of cache read tokens
+    def extract_cache_read_tokens(usage)
+      return 0 unless usage
+      
+      # Try different field names used by OpenRouter/providers
+      cache_read = usage['cache_read_input_tokens'] ||
+                   usage['cached_tokens'] ||
+                   usage['prompt_tokens_details']&.dig('cached_tokens') ||
+                   0
+      
+      cache_read.to_i
+    end
+    
+    # Log a comprehensive summary of token usage including cache statistics
+    # @param message_id [Integer] The message ID
+    # @param update_data [Hash] The data being saved
+    # @param cache_creation [Integer] Cache creation tokens
+    # @param cache_read [Integer] Cache read tokens  
+    # @param response [Hash] The full API response
+    def log_usage_summary(message_id, update_data, cache_creation, cache_read, response)
+      prompt_tokens = update_data[:prompt_tokens] || 0
+      completion_tokens = update_data[:completion_tokens] || 0
+      total_tokens = update_data[:api_total_tokens] || 0
+      
+      # Basic usage log
+      Rails.logger.info("[LLM USAGE] Message ##{message_id}: " \
+                        "prompt=#{prompt_tokens}, completion=#{completion_tokens}, total=#{total_tokens}")
+      
+      # Cache-specific logging
+      if cache_creation > 0 || cache_read > 0
+        cache_hit_rate = prompt_tokens > 0 ? ((cache_read.to_f / prompt_tokens) * 100).round(1) : 0
+        
+        Rails.logger.info("[CACHE STATS] Message ##{message_id}: " \
+                          "cache_creation=#{cache_creation}, " \
+                          "cache_read=#{cache_read}, " \
+                          "cache_hit_rate=#{cache_hit_rate}%")
+        
+        # Estimate savings (Anthropic: ~90% discount on cached reads)
+        if cache_read > 0
+          estimated_savings_tokens = (cache_read * 0.9).round
+          Rails.logger.info("[CACHE SAVINGS] Estimated #{estimated_savings_tokens} tokens saved via cache")
+        end
+        
+        if cache_creation > 0
+          Rails.logger.info("[CACHE INFO] #{cache_creation} tokens added to cache (future requests may benefit)")
+        end
+      else
+        Rails.logger.debug("[CACHE STATS] Message ##{message_id}: No cache tokens in response")
+      end
+      
+      # Log cache discount if available from OpenRouter
+      if response['cache_discount'].present?
+        discount_percent = (response['cache_discount'].to_f * 100).round(1)
+        Rails.logger.info("[CACHE DISCOUNT] #{discount_percent}% discount applied")
+      end
+      
+      # Log native_tokens_cached if available (from generation endpoint)
+      if response['native_tokens_cached'].present?
+        Rails.logger.info("[CACHE NATIVE] #{response['native_tokens_cached']} native tokens cached")
+      end
     end
 
     # Make a follow-up call to the LLM with the tool results
