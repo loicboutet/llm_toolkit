@@ -82,10 +82,18 @@ module LlmToolkit
         class_params = parameters[self.name] || {}
         
         class_params.each do |param_name, options|
-          result[param_name.to_s] = {
+          prop = {
             type: type_to_string(options[:type]),
             description: options[:description] || param_name.to_s
           }
+          
+          # OpenAI requires array types to have an "items" schema
+          # Other providers (Claude/Anthropic) are more lenient but this is valid JSON Schema
+          if options[:type] == :array
+            prop[:items] = { type: "string" }
+          end
+          
+          result[param_name.to_s] = prop
         end
         result
       end
