@@ -255,19 +255,18 @@ module LlmToolkit
         
         if cached_count > 0
           Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to #{cached_count} message(s) (#{total_cached_chars} total chars)")
+        else
+          Rails.logger.info("[CONVERSATION CACHE] No cache_control applied to conversation history")
         end
       end
       
       # Fix conversation history for OpenRouter API compatibility
-      # - Converts array content to string for simple text messages
-      # - Applies cache_control ONLY to the LAST user/assistant message (NOT tool messages)
+      # - Applies cache_control to the LAST user/assistant message (NOT tool messages)
       # - Ensures nil content becomes empty string (some models like o4-mini reject null)
-      # - Preserves tool_calls structure
+      # - Preserves multimodal content (images, files) while adding cache_control to text
+      # - Tool messages MUST have string content (API rejects array content for tool messages)
       #
-      # IMPORTANT: Tool messages MUST have string content, not array content.
-      # The Anthropic API (via OpenRouter) rejects tool messages with array content.
-      #
-      # Note: Anthropic limits to 4 cache_control blocks max. System messages use 1,
+      # IMPORTANT: Anthropic limits to 4 cache_control blocks max. System messages use 1,
       # so we only apply 1 cache_control in conversation (to the last cacheable message).
       def fix_conversation_history_for_openrouter(conversation_history)
         messages = Array(conversation_history)
@@ -285,49 +284,37 @@ module LlmToolkit
           # CRITICAL: Tool messages must ALWAYS have string content
           # Never convert tool message content to array format
           if is_tool_message
-            # Ensure tool message content is a string
-            if msg[:content].is_a?(Array)
-              # Extract text from array format
-              text_content = msg[:content].map { |item| item[:text] || item['text'] }.compact.join("\n")
-              fixed_msg[:content] = text_content
-            elsif msg[:content].nil?
-              fixed_msg[:content] = ""
-            end
-            # String content stays as-is for tool messages
+            fixed_msg[:content] = ensure_string_content(msg[:content])
             next fixed_msg
           end
           
           # Handle content formatting for non-tool messages (user/assistant)
-          if msg[:content].is_a?(Array) && msg[:content].all? { |item| item.is_a?(Hash) && (item[:type] || item['type']) && (item[:text] || item['text']) }
-            # Content is already in array format - extract text
-            text_content = msg[:content].map { |item| item[:text] || item['text'] }.join("\n")
-            
-            # Apply cache_control only to the last cacheable message
-            if is_last_cacheable && conversation_caching_enabled?
-              fixed_msg[:content] = [
-                { type: 'text', text: text_content, cache_control: { type: 'ephemeral' } }
-              ]
-              Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to last message (#{msg[:role]}, #{text_content.length} chars)")
-            else
-              fixed_msg[:content] = text_content
-            end
-          elsif msg[:content].nil?
-            # CRITICAL FIX: Convert nil content to empty string
-            # Some models (o4-mini via OpenRouter) reject null content in assistant messages
+          content = msg[:content]
+          
+          if content.nil?
+            # Convert nil content to empty string
             fixed_msg[:content] = ""
-          elsif msg[:content].is_a?(String)
-            # String content - apply cache_control only to the last cacheable message
+          elsif content.is_a?(String)
+            # String content - convert to array format with cache_control if last cacheable
             if is_last_cacheable && conversation_caching_enabled?
               fixed_msg[:content] = [
-                { type: 'text', text: msg[:content], cache_control: { type: 'ephemeral' } }
+                { type: 'text', text: content, cache_control: { type: 'ephemeral' } }
               ]
-              Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to last message (#{msg[:role]}, #{msg[:content].length} chars)")
+              Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to last message (#{msg[:role]}, #{content.length} chars)")
             end
             # Otherwise keep as string (no change needed)
+          elsif content.is_a?(Array)
+            # Array content - could be multimodal (text + images) or just text
+            if is_last_cacheable && conversation_caching_enabled?
+              # Apply cache_control to the LAST text block in the array
+              fixed_msg[:content] = apply_cache_control_to_content_array(content)
+              text_chars = content.sum { |item| get_text_from_item(item)&.length.to_i }
+              Rails.logger.info("[CONVERSATION CACHE] Applied cache_control to last message (#{msg[:role]}, #{text_chars} chars in array)")
+            end
+            # Otherwise keep array as-is
           end
           
           # Ensure tool_calls is preserved if present
-          # This handles assistant messages that have tool_calls
           if msg[:tool_calls].present?
             fixed_msg[:tool_calls] = msg[:tool_calls]
           end
@@ -336,8 +323,54 @@ module LlmToolkit
         end
       end
       
+      # Apply cache_control to the last text item in a content array
+      # Preserves multimodal content (images, files) while caching text
+      def apply_cache_control_to_content_array(content_array)
+        return content_array if content_array.blank?
+        
+        # Find the last text item index
+        last_text_index = nil
+        content_array.each_with_index do |item, idx|
+          item_type = item[:type] || item['type']
+          if item_type == 'text'
+            last_text_index = idx
+          end
+        end
+        
+        # If no text items, return array as-is
+        return content_array if last_text_index.nil?
+        
+        # Create new array with cache_control on last text item
+        content_array.each_with_index.map do |item, idx|
+          if idx == last_text_index
+            item_dup = item.dup
+            item_dup[:cache_control] = { type: 'ephemeral' }
+            item_dup
+          else
+            item
+          end
+        end
+      end
+      
+      # Extract text content from a content item (handles both symbol and string keys)
+      def get_text_from_item(item)
+        return nil unless item.is_a?(Hash)
+        item[:text] || item['text']
+      end
+      
+      # Ensure content is a string (for tool messages)
+      def ensure_string_content(content)
+        if content.is_a?(Array)
+          # Extract text from array format
+          content.map { |item| get_text_from_item(item) }.compact.join("\n")
+        elsif content.nil?
+          ""
+        else
+          content.to_s
+        end
+      end
+      
       # Check if conversation caching is enabled
-      # Uses the same setting as system message caching
       def conversation_caching_enabled?
         LlmToolkit.config.enable_prompt_caching
       end
@@ -350,11 +383,19 @@ module LlmToolkit
           next unless message[:content].is_a?(Array)
           
           message[:content].each do |content_item|
-            if content_item[:type] == 'file' && content_item[:file][:file_data]
+            if content_item[:type] == 'file' && content_item[:file]&.[](:file_data)
               # Replace large base64 content with placeholder
               file_data = content_item[:file][:file_data]
               if file_data.length > 100
                 content_item[:file][:file_data] = "#{file_data[0..50]}... [TRUNCATED #{file_data.length} chars]"
+              end
+            end
+            
+            # Handle image_url type
+            if content_item[:type] == 'image_url' && content_item[:image_url]&.[](:url)
+              url = content_item[:image_url][:url]
+              if url.length > 100
+                content_item[:image_url][:url] = "#{url[0..50]}... [TRUNCATED #{url.length} chars]"
               end
             end
             
