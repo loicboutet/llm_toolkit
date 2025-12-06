@@ -22,7 +22,7 @@ module LlmToolkit
     after_create_commit :broadcast_message_created, if: :llm_content?
     
     # For content updates during streaming, only update the specific content element
-    # This is MUCH more efficient than replacing the entire conversation
+    # This prevents re-rendering the entire conversation on every token
     after_update_commit :broadcast_content_update_throttled, if: -> { saved_change_to_content? && llm_content? }
     
     # When tokens are updated (message complete), broadcast full frame and header stats
@@ -261,54 +261,63 @@ module LlmToolkit
       role == 'assistant'
     end
 
+    # Total tokens for this message (prompt + completion)
+    # Uses the new fields (prompt_tokens, completion_tokens) which are populated by OpenRouter
     def total_tokens
-      (prompt_tokens.to_i + completion_tokens.to_i).nonzero? || 
-        (input_tokens.to_i + cache_creation_input_tokens.to_i + cache_read_input_tokens.to_i + output_tokens.to_i)
+      prompt_tokens.to_i + completion_tokens.to_i
     end
 
-    # Calculate cost based on model pricing if available, otherwise use fallback rates
+    # Calculate cost based on model pricing if available
+    # Uses the ModelPricing#calculate_cost method which handles cache pricing correctly
     def calculate_cost
       pricing = llm_model&.model_pricing
       
       if pricing
-        prompt_cost = (prompt_tokens.to_i * pricing.prompt_price_per_million_tokens.to_f) / 1_000_000
-        completion_cost = (completion_tokens.to_i * pricing.completion_price_per_million_tokens.to_f) / 1_000_000
-        
-        # Add cache cost calculations if cache pricing exists
-        if pricing.respond_to?(:cache_read_price_per_million_tokens) && cache_read_input_tokens.to_i > 0
-          cache_read_cost = (cache_read_input_tokens.to_i * pricing.cache_read_price_per_million_tokens.to_f) / 1_000_000
-          prompt_cost += cache_read_cost
-        end
-        
-        if pricing.respond_to?(:cache_creation_price_per_million_tokens) && cache_creation_input_tokens.to_i > 0
-          cache_creation_cost = (cache_creation_input_tokens.to_i * pricing.cache_creation_price_per_million_tokens.to_f) / 1_000_000
-          prompt_cost += cache_creation_cost
-        end
-        
-        prompt_cost + completion_cost
+        pricing.calculate_cost(
+          prompt_tokens: prompt_tokens.to_i,
+          completion_tokens: completion_tokens.to_i,
+          cache_read_tokens: cache_read_input_tokens.to_i,
+          cache_creation_tokens: cache_creation_input_tokens.to_i
+        )
       else
         # Fallback to hardcoded rates (Claude-like pricing)
-        (input_tokens.to_i * 0.000003) +
-        (cache_creation_input_tokens.to_i * 0.00000375) +
-        (cache_read_input_tokens.to_i * 0.0000003) +
-        (output_tokens.to_i * 0.000015)
+        # Standard prompt: $3/1M, Completion: $15/1M
+        # Cache read: $0.30/1M (10% of prompt), Cache write: $3.75/1M (125% of prompt)
+        prompt_cost = 0.0
+        
+        # Calculate non-cached prompt cost
+        non_cached_prompts = [prompt_tokens.to_i - cache_read_input_tokens.to_i, 0].max
+        prompt_cost += non_cached_prompts * 0.000003  # $3/1M = $0.000003/token
+        
+        # Cache read cost (10% of prompt price)
+        prompt_cost += cache_read_input_tokens.to_i * 0.0000003  # $0.30/1M
+        
+        # Cache creation cost (125% of prompt price)
+        prompt_cost += cache_creation_input_tokens.to_i * 0.00000375  # $3.75/1M
+        
+        # Completion cost
+        completion_cost = completion_tokens.to_i * 0.000015  # $15/1M
+        
+        prompt_cost + completion_cost
       end
     end
     
     # Check if we have cost data to display
     def has_cost_data?
-      prompt_tokens.to_i > 0 || completion_tokens.to_i > 0 || 
-        input_tokens.to_i > 0 || output_tokens.to_i > 0 ||
-        cache_creation_input_tokens.to_i > 0 || cache_read_input_tokens.to_i > 0
+      prompt_tokens.to_i > 0 || completion_tokens.to_i > 0
     end
     
     # Get cache statistics for this message
     def cache_stats
+      cache_creation = cache_creation_input_tokens.to_i
+      cache_read = cache_read_input_tokens.to_i
+      prompt = prompt_tokens.to_i
+      
       {
-        cache_creation_tokens: cache_creation_input_tokens.to_i,
-        cache_read_tokens: cache_read_input_tokens.to_i,
-        has_cache: cache_creation_input_tokens.to_i > 0 || cache_read_input_tokens.to_i > 0,
-        cache_hit_rate: prompt_tokens.to_i > 0 ? ((cache_read_input_tokens.to_f / prompt_tokens) * 100).round(1) : 0
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cache_read,
+        has_cache: cache_creation > 0 || cache_read > 0,
+        cache_hit_rate: prompt > 0 ? ((cache_read.to_f / prompt) * 100).round(1) : 0
       }
     end
     

@@ -60,6 +60,9 @@ module LlmToolkit
 
       # Track the last error to avoid repeated error messages
       @last_error = nil
+      
+      # Track pending usage data to apply to correct message
+      @pending_usage_for_message = nil
     end
 
     # Main method to call the LLM and process the streamed response
@@ -114,18 +117,23 @@ module LlmToolkit
       # Get conversation history, formatted for the specific model's provider type
       conv_history = @conversation.history(llm_model: @llm_model)
       
+      # IMPORTANT: Capture the message that will receive usage data BEFORE streaming
+      # This ensures tokens go to the correct message even if followup_with_tools changes @current_message
+      message_for_usage = @current_message
+      
       # Call the LLM provider with streaming and handle each chunk
       final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model: @llm_model) do |chunk|
         process_chunk(chunk)
       end
 
-      # Update the current message with usage data if available
-      update_message_usage_from_response(final_response, @current_message)
+      # Update the message that was active at the START of this stream with usage data
+      # Use message_for_usage, NOT @current_message (which may have changed during followup)
+      update_message_usage_from_response(final_response, message_for_usage)
 
       # Update the finish_reason from the final response if we don't have one from streaming
       if final_response && final_response['finish_reason'] && @finish_reason.nil?
         @finish_reason = final_response['finish_reason']
-        @current_message.update(finish_reason: @finish_reason)
+        message_for_usage.update(finish_reason: @finish_reason)
         Rails.logger.info("Updated finish_reason from final response: #{@finish_reason}")
       end
 
@@ -143,7 +151,7 @@ module LlmToolkit
       end
 
       # Special case: If we collected a URL input but haven't created a get_url tool yet
-      if @special_url_input && !@current_message.tool_uses.exists?(name: "get_url")
+      if @special_url_input && !message_for_usage.tool_uses.exists?(name: "get_url")
         dangerous_encountered = handle_special_url_tool
         
         if !dangerous_encountered && @tool_results_pending
@@ -177,8 +185,9 @@ module LlmToolkit
       usage = response['usage']
       
       # Log raw response for debugging
-      Rails.logger.info("[TOKEN USAGE] Raw response: #{response.keys.inspect}")
+      Rails.logger.info("[TOKEN USAGE] Raw response keys: #{response.keys.inspect}")
       Rails.logger.info("[TOKEN USAGE] Usage data: #{usage.inspect}")
+      Rails.logger.info("[TOKEN USAGE] Applying to message ##{message.id}")
       
       return unless usage
       
@@ -317,6 +326,9 @@ module LlmToolkit
       
       # Create a new message for the followup response, associated with the model
       @current_message = create_empty_message
+      
+      # IMPORTANT: Capture the message for this followup BEFORE streaming
+      message_for_usage = @current_message
 
       begin
         # Call the LLM provider with streaming and handle each chunk
@@ -324,13 +336,13 @@ module LlmToolkit
           process_chunk(chunk)
         end
 
-        # Update the current message (the follow-up message) with usage data if available
-        update_message_usage_from_response(final_response, @current_message)
+        # Update the message that was active at the START of this followup with usage data
+        update_message_usage_from_response(final_response, message_for_usage)
 
         # Update the finish_reason from the final response if we don't have one from streaming
         if final_response && final_response['finish_reason'] && @finish_reason.nil?
           @finish_reason = final_response['finish_reason']
-          @current_message.update(finish_reason: @finish_reason)
+          message_for_usage.update(finish_reason: @finish_reason)
           Rails.logger.info("Updated finish_reason from final response: #{@finish_reason}")
         end
 
@@ -460,6 +472,8 @@ module LlmToolkit
           end
 
           # If we accumulated tool calls, process them
+          # NOTE: We process tool calls here but do NOT immediately call followup_with_tools
+          # The followup happens AFTER stream_llm returns and usage is recorded
           unless @accumulated_tool_calls.empty?
             complete_tool_calls = @accumulated_tool_calls.values.sort_by { |tc| tc['index'] || 0 }
             Rails.logger.debug "Accumulated complete tool calls: #{complete_tool_calls.inspect}"
@@ -469,14 +483,11 @@ module LlmToolkit
             formatted_tool_calls = @llm_provider.send(:format_tools_response_from_openrouter, complete_tool_calls)
             Rails.logger.debug "Formatted tool calls for processing: #{formatted_tool_calls.inspect}"
 
-            dangerous_encountered = process_tool_calls(formatted_tool_calls)
+            process_tool_calls(formatted_tool_calls)
             
-            if @tool_results_pending && !@conversation.waiting? && !dangerous_encountered
-              Rails.logger.info("Tool results pending after processing tools in 'finish' handler - initiating followup")
-              followup_with_tools
-            else
-              Rails.logger.info("No immediate followup needed: pending=#{@tool_results_pending}, waiting=#{@conversation.waiting?}, dangerous=#{dangerous_encountered}")
-            end
+            # Mark that followup is needed, but DON'T call it here
+            # This allows stream_llm to record usage on the correct message first
+            Rails.logger.info("Tool results pending: #{@tool_results_pending}, waiting: #{@conversation.waiting?}")
           end
           @accumulated_tool_calls = {}
         else
