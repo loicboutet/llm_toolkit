@@ -83,6 +83,8 @@ module LlmToolkit
 
         # Start the LLM streaming interaction
         stream_llm
+        
+        Rails.logger.info("[STREAMING SERVICE] stream_llm completed normally")
 
         true
       rescue => e
@@ -98,6 +100,7 @@ module LlmToolkit
         
         false
       ensure
+        Rails.logger.info("[STREAMING SERVICE] Entering ensure block, tool_results_pending=#{@tool_results_pending}")
         # Set conversation status to resting when done, unless waiting for approval
         @conversation.update(status: :resting) unless @conversation.status_waiting?
       end
@@ -121,14 +124,20 @@ module LlmToolkit
       # This ensures tokens go to the correct message even if followup_with_tools changes @current_message
       message_for_usage = @current_message
       
+      Rails.logger.info("[STREAM_LLM] Starting stream_chat call")
+      
       # Call the LLM provider with streaming and handle each chunk
       final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model: @llm_model) do |chunk|
         process_chunk(chunk)
       end
 
+      Rails.logger.info("[STREAM_LLM] stream_chat returned, tool_results_pending=#{@tool_results_pending}")
+
       # Update the message that was active at the START of this stream with usage data
       # Use message_for_usage, NOT @current_message (which may have changed during followup)
       update_message_usage_from_response(final_response, message_for_usage)
+
+      Rails.logger.info("[STREAM_LLM] After update_message_usage_from_response, tool_results_pending=#{@tool_results_pending}")
 
       # Update the finish_reason from the final response if we don't have one from streaming
       if final_response && final_response['finish_reason'] && @finish_reason.nil?
@@ -162,12 +171,15 @@ module LlmToolkit
       end
 
       # Check if we have any tool results but haven't done a follow-up yet
+      # This is the main check that triggers followup after tools were processed during streaming
       Rails.logger.info("End of stream_llm - Tool results pending: #{@tool_results_pending}, Conversation waiting: #{@conversation.waiting?}")
       if @tool_results_pending && !@conversation.waiting?
         sleep(0.5)
         Rails.logger.info("Making follow-up call to LLM after end of streaming")
         followup_with_tools
       end
+      
+      Rails.logger.info("[STREAM_LLM] Exiting stream_llm method")
     end
 
     # Update message with usage data from the API response
@@ -217,6 +229,8 @@ module LlmToolkit
       
       # Log comprehensive usage summary
       log_usage_summary(message.id, update_data, response)
+      
+      Rails.logger.info("[TOKEN USAGE] update_message_usage_from_response completed")
     end
     
     # Extract cache creation tokens from various response formats
@@ -301,10 +315,7 @@ module LlmToolkit
 
       Rails.logger.info("Starting follow-up call ##{@followup_count} to LLM with tool results")
       
-      # Keep track of whether we had tool results before this call
-      had_tool_results = @tool_results_pending
-      
-      # Reset streaming variables
+      # Reset streaming variables for this followup
       @current_content = ""
       @accumulated_tool_calls = {} # Reset accumulator
       @processed_tool_call_ids = Set.new
@@ -336,6 +347,8 @@ module LlmToolkit
           process_chunk(chunk)
         end
 
+        Rails.logger.info("[FOLLOWUP] stream_chat returned, tool_results_pending=#{@tool_results_pending}")
+
         # Update the message that was active at the START of this followup with usage data
         update_message_usage_from_response(final_response, message_for_usage)
 
@@ -346,26 +359,42 @@ module LlmToolkit
           Rails.logger.info("Updated finish_reason from final response: #{@finish_reason}")
         end
 
-        # Handle any tool calls in the final response
-        if final_response && final_response['tool_calls'].present? && !@content_chunks_received
+        # Handle any tool calls in the final response (fallback if streaming didn't capture them)
+        if final_response && final_response['tool_calls'].present? && !@content_chunks_received && @accumulated_tool_calls.empty?
+          Rails.logger.info("[FOLLOWUP] Processing tool calls from final_response")
           formatted_tool_calls = @llm_provider.send(:format_tools_response_from_openrouter, final_response['tool_calls'])
           dangerous_encountered = process_tool_calls(formatted_tool_calls)
           
           if !dangerous_encountered && @tool_results_pending
             sleep(0.5)
+            Rails.logger.info("[FOLLOWUP] Making recursive follow-up call after final_response tool calls")
             followup_with_tools
+            return # Important: return after recursive call to avoid duplicate checks
           end
         end
         
-        # Check for multi-step tool interactions
-        if had_tool_results && !@tool_results_pending && !@conversation.waiting? &&
-          @current_message.content.present? && looks_like_attempting_tool_use(@current_message.content)
-          
-          Rails.logger.info("LLM appears to be attempting to use tools again. Making another follow-up call.")
+        # CRITICAL FIX: Check if we have tool results pending from streaming
+        # This handles the case where tools were processed during the 'finish' chunk
+        Rails.logger.info("[FOLLOWUP] End of followup - Tool results pending: #{@tool_results_pending}, Conversation waiting: #{@conversation.waiting?}")
+        if @tool_results_pending && !@conversation.waiting?
+          sleep(0.5)
+          Rails.logger.info("[FOLLOWUP] Making follow-up call after tool execution during streaming")
+          followup_with_tools
+          return # Important: return after recursive call
+        end
+        
+        # Check for multi-step tool interactions (LLM text indicates it wants to use tools)
+        if @current_message.content.present? && !@conversation.waiting? && 
+           looks_like_attempting_tool_use(@current_message.content)
+          Rails.logger.info("[FOLLOWUP] LLM appears to be attempting to use tools again based on content.")
           @tool_results_pending = true
           sleep(0.5)
           followup_with_tools
+          return
         end
+        
+        Rails.logger.info("[FOLLOWUP] Followup ##{@followup_count} completed without needing further followup")
+        
       rescue => e
         error_message = "Error in followup call: #{e.message}"
         Rails.logger.error(error_message)
@@ -473,7 +502,7 @@ module LlmToolkit
 
           # If we accumulated tool calls, process them
           # NOTE: We process tool calls here but do NOT immediately call followup_with_tools
-          # The followup happens AFTER stream_llm returns and usage is recorded
+          # The followup happens AFTER the streaming method returns and usage is recorded
           unless @accumulated_tool_calls.empty?
             complete_tool_calls = @accumulated_tool_calls.values.sort_by { |tc| tc['index'] || 0 }
             Rails.logger.debug "Accumulated complete tool calls: #{complete_tool_calls.inspect}"
@@ -486,7 +515,7 @@ module LlmToolkit
             process_tool_calls(formatted_tool_calls)
             
             # Mark that followup is needed, but DON'T call it here
-            # This allows stream_llm to record usage on the correct message first
+            # This allows the calling method (stream_llm or followup_with_tools) to record usage first
             Rails.logger.info("Tool results pending: #{@tool_results_pending}, waiting: #{@conversation.waiting?}")
           end
           @accumulated_tool_calls = {}
