@@ -2,6 +2,11 @@ module LlmToolkit
   class CallStreamingLlmJob < ApplicationJob
     queue_as :llm
 
+    # Ensure only one job per conversation runs at a time
+    # Additional jobs will wait in queue until the current one finishes
+    # The key is the conversation_id (first argument)
+    limits_concurrency to: 1, key: ->(conversation_id, *) { "conversation_#{conversation_id}" }
+
     # Process streaming LLM requests asynchronously
     #
     # @param conversation_id [Integer] The ID of the conversation to process
@@ -15,6 +20,13 @@ module LlmToolkit
       original_llm_model = LlmToolkit::LlmModel.find_by(id: llm_model_id)
 
       return unless conversation && original_llm_model
+
+      # Skip if conversation is already being processed by another mechanism
+      # This is a secondary guard in case the concurrency limit doesn't catch it
+      if conversation.working?
+        Rails.logger.info("⏭️ Skipping job - conversation #{conversation_id} is already working")
+        return
+      end
 
       # Ensure tool_class_names is an array before mapping
       safe_tool_class_names = Array(tool_class_names)
