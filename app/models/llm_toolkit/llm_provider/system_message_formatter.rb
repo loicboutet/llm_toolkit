@@ -6,15 +6,24 @@ module LlmToolkit
       private
       
       # Format system messages for OpenRouter, handling both simple and complex formats
-      # Applies cache_control ONLY to the last content block (regardless of size)
-      # This ensures we stay within Anthropic's 4 cache_control block limit
+      #
+      # CACHING STRATEGY for Anthropic via OpenRouter:
+      # - cache_control marks the END of a cacheable prefix
+      # - Anthropic caches "everything up to this breakpoint"
+      # - System messages are STATIC (don't change between requests)
+      # - So we apply cache_control to the LAST content block of system messages
+      # - This caches the entire system prompt for subsequent requests
+      #
+      # Key insight: The cache key is based on ALL content BEFORE the cache_control marker.
+      # If that content matches a previous request, you get a cache HIT (0.1x price).
+      # If it doesn't match, you get a cache WRITE (1.25x price).
       def format_system_messages_for_openrouter(system_messages)
         return [] if system_messages.blank?
         
         # Check if we have complex OpenRouter format (array of message objects)
         if complex_system_messages?(system_messages)
           Rails.logger.info "Using complex system message format for OpenRouter"
-          return apply_cache_control_to_last_block(system_messages)
+          return apply_cache_control_to_system_messages(system_messages)
         end
         
         # Convert simple format to OpenRouter format
@@ -25,7 +34,7 @@ module LlmToolkit
         
         content_item = { type: 'text', text: system_message_content }
         
-        # Apply cache control to the single content block (it's the last/only one)
+        # Apply cache control - system messages are static, so cache them
         if caching_enabled?
           content_item[:cache_control] = { type: 'ephemeral' }
           Rails.logger.info "[SYSTEM CACHE] Applied cache_control to system message (#{system_message_content.length} chars)"
@@ -37,24 +46,32 @@ module LlmToolkit
         }]
       end
       
-      # Apply cache_control ONLY to the last content block in complex messages
-      # This respects Anthropic's limit of 4 cache_control blocks maximum
-      def apply_cache_control_to_last_block(messages)
+      # Apply cache_control to system messages
+      # 
+      # Strategy: Apply to the LAST text block of the LAST system message.
+      # This caches the entire system prompt since it comes first in the request.
+      #
+      # Why the last block? Because Anthropic's cache_control means:
+      # "Cache everything in the request UP TO AND INCLUDING this block"
+      #
+      # Note: Anthropic has a limit of 4 cache_control blocks total.
+      # We use 1 for system messages, leaving 3 for conversation history.
+      def apply_cache_control_to_system_messages(messages)
         return messages unless caching_enabled?
         
-        # Find the last message and its last content block
-        # We need to track the global last block across all messages
+        # Find the last text block across all system messages
         last_msg_index = nil
         last_content_index = nil
+        total_system_chars = 0
         
         messages.each_with_index do |msg, msg_idx|
           next unless msg[:content].is_a?(Array) && msg[:content].any?
           
-          # Find the last text block in this message
           msg[:content].each_with_index do |content_item, content_idx|
             if content_item[:type] == 'text'
               last_msg_index = msg_idx
               last_content_index = content_idx
+              total_system_chars += content_item[:text]&.length.to_i
             end
           end
         end
@@ -62,16 +79,15 @@ module LlmToolkit
         # No text content found
         return messages if last_msg_index.nil?
         
-        # Apply cache_control only to the last text block
+        # Apply cache_control to the last text block (end of system prompt)
         messages.each_with_index.map do |msg, msg_idx|
           next msg unless msg[:content].is_a?(Array)
           
           updated_content = msg[:content].each_with_index.map do |content_item, content_idx|
-            # Only apply to the very last text block
             if msg_idx == last_msg_index && content_idx == last_content_index
               content_item = content_item.dup
               content_item[:cache_control] = { type: 'ephemeral' }
-              Rails.logger.info "[SYSTEM CACHE] Applied cache_control to last content block (#{content_item[:text]&.length || 0} chars)"
+              Rails.logger.info "[SYSTEM CACHE] Applied cache_control to end of system messages (#{total_system_chars} total chars cached)"
             end
             content_item
           end
@@ -85,7 +101,7 @@ module LlmToolkit
         LlmToolkit.config.enable_prompt_caching
       end
       
-      # Get the cache threshold from configuration (kept for backward compatibility)
+      # Get the cache threshold from configuration
       def cache_threshold
         LlmToolkit.config.cache_text_threshold || 2048
       end
