@@ -102,6 +102,7 @@ module LlmToolkit
       ensure
         Rails.logger.info("[STREAMING SERVICE] Entering ensure block, tool_results_pending=#{@tool_results_pending}")
         # Set conversation status to resting when done, unless waiting for approval
+        @conversation.reload
         @conversation.update(status: :resting) unless @conversation.status_waiting?
       end
     end
@@ -146,13 +147,16 @@ module LlmToolkit
         Rails.logger.info("Updated finish_reason from final response: #{@finish_reason}")
       end
 
+      # Reload conversation to get latest status (may have been updated by tool execution)
+      @conversation.reload
+
       # Final processing happens within the 'finish' chunk handler now.
       if final_response && final_response['tool_calls'].present? && !@content_chunks_received && @accumulated_tool_calls.empty?
         Rails.logger.warn("Processing tool calls from final_response as no streaming chunks were processed.")
         formatted_tool_calls = @llm_provider.send(:format_tools_response_from_openrouter, final_response['tool_calls'])
         dangerous_encountered = process_tool_calls(formatted_tool_calls)
 
-        if !dangerous_encountered && @tool_results_pending
+        if !dangerous_encountered && @tool_results_pending && !@conversation.waiting?
           sleep(0.5) 
           Rails.logger.info("Making follow-up call to LLM with tool results from final response")
           followup_with_tools
@@ -163,7 +167,7 @@ module LlmToolkit
       if @special_url_input && !message_for_usage.tool_uses.exists?(name: "get_url")
         dangerous_encountered = handle_special_url_tool
         
-        if !dangerous_encountered && @tool_results_pending
+        if !dangerous_encountered && @tool_results_pending && !@conversation.waiting?
           sleep(0.5)
           Rails.logger.info("Making follow-up call to LLM with tool results from special URL")
           followup_with_tools
@@ -172,6 +176,7 @@ module LlmToolkit
 
       # Check if we have any tool results but haven't done a follow-up yet
       # This is the main check that triggers followup after tools were processed during streaming
+      # IMPORTANT: Also check if conversation is waiting (e.g., for sub-agent completion)
       Rails.logger.info("End of stream_llm - Tool results pending: #{@tool_results_pending}, Conversation waiting: #{@conversation.waiting?}")
       if @tool_results_pending && !@conversation.waiting?
         sleep(0.5)
@@ -303,7 +308,10 @@ module LlmToolkit
 
     # Make a follow-up call to the LLM with the tool results
     def followup_with_tools
-      # Skip if we're already waiting for approval
+      # Reload conversation to get latest status
+      @conversation.reload
+      
+      # Skip if we're already waiting for approval or sub-agent
       return if @conversation.waiting?
       
       # Increment followup count and check safety limit
@@ -359,13 +367,16 @@ module LlmToolkit
           Rails.logger.info("Updated finish_reason from final response: #{@finish_reason}")
         end
 
+        # Reload conversation to get latest status
+        @conversation.reload
+
         # Handle any tool calls in the final response (fallback if streaming didn't capture them)
         if final_response && final_response['tool_calls'].present? && !@content_chunks_received && @accumulated_tool_calls.empty?
           Rails.logger.info("[FOLLOWUP] Processing tool calls from final_response")
           formatted_tool_calls = @llm_provider.send(:format_tools_response_from_openrouter, final_response['tool_calls'])
           dangerous_encountered = process_tool_calls(formatted_tool_calls)
           
-          if !dangerous_encountered && @tool_results_pending
+          if !dangerous_encountered && @tool_results_pending && !@conversation.waiting?
             sleep(0.5)
             Rails.logger.info("[FOLLOWUP] Making recursive follow-up call after final_response tool calls")
             followup_with_tools
@@ -375,6 +386,7 @@ module LlmToolkit
         
         # CRITICAL FIX: Check if we have tool results pending from streaming
         # This handles the case where tools were processed during the 'finish' chunk
+        # Also ensure conversation is not waiting (e.g., for sub-agent)
         Rails.logger.info("[FOLLOWUP] End of followup - Tool results pending: #{@tool_results_pending}, Conversation waiting: #{@conversation.waiting?}")
         if @tool_results_pending && !@conversation.waiting?
           sleep(0.5)
@@ -516,7 +528,7 @@ module LlmToolkit
             
             # Mark that followup is needed, but DON'T call it here
             # This allows the calling method (stream_llm or followup_with_tools) to record usage first
-            Rails.logger.info("Tool results pending: #{@tool_results_pending}, waiting: #{@conversation.waiting?}")
+            Rails.logger.info("Tool results pending: #{@tool_results_pending}, waiting: #{@conversation.reload.waiting?}")
           end
           @accumulated_tool_calls = {}
         else
@@ -581,7 +593,11 @@ module LlmToolkit
       else
         saved_tool_use.update(status: :approved)
         execute_tool(saved_tool_use)
-        @tool_results_pending = true
+        
+        # Only mark results pending if conversation is not waiting
+        # (tool might have set it to waiting, e.g., sub_agent)
+        @conversation.reload
+        @tool_results_pending = true unless @conversation.waiting?
       end
       
       @special_url_input = nil
@@ -660,7 +676,16 @@ module LlmToolkit
             else
               saved_tool_use.update(status: :approved)
               execute_tool(saved_tool_use)
-              @tool_results_pending = true
+              
+              # IMPORTANT: Only mark tool_results_pending if conversation is NOT waiting
+              # Tools like sub_agent set conversation to waiting, and we should NOT followup
+              # until the sub-agent completes and resumes the parent conversation
+              @conversation.reload
+              unless @conversation.waiting?
+                @tool_results_pending = true
+              else
+                Rails.logger.info("Tool #{name} set conversation to waiting - not marking results pending")
+              end
             end
           else
             rejection_message = "The tool '#{name}' is not available in the current context. Please use only the tools provided in the system prompt."

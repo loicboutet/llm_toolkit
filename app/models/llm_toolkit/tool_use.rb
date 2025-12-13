@@ -1,5 +1,8 @@
 module LlmToolkit
   class ToolUse < ApplicationRecord
+    # Include ActionView helpers needed for dom_id in broadcasts
+    include ActionView::RecordIdentifier
+    
     belongs_to :message, class_name: 'LlmToolkit::Message'
     has_one :tool_result, class_name: 'LlmToolkit::ToolResult', dependent: :destroy
     
@@ -15,8 +18,11 @@ module LlmToolkit
     after_update :touch_conversation
     after_destroy :touch_conversation
 
-    # Broadcast changes to the conversation stream
-    after_create_commit :broadcast_append_to_message
+    # NOTE: We do NOT broadcast on create because the Message model's broadcast_full_frame
+    # will include all tool_uses when it re-renders the conversation.
+    # Broadcasting on create would cause duplicates.
+    
+    # Only broadcast on UPDATE to refresh status changes (approved, rejected, etc.)
     after_update_commit :broadcast_replace_in_message
 
     def dangerous?
@@ -55,24 +61,20 @@ module LlmToolkit
       message.conversation.touch
     end
 
-    # Broadcasts appending the tool use partial to its message
-    def broadcast_append_to_message
-      broadcast_append_later_to(
-        message.conversation,               # Stream name derived from the conversation
-        target: "tool_uses_for_message_#{message.id}", # Target container within the message partial
-        partial: "tool_uses/tool_use",      # The specific tool use partial
-        locals: { tool_use: self }
-      )
-    end
-
     # Broadcasts replacing the tool use partial within its message
+    # Uses tool_use_nexrai partial to match what's rendered in message partials
     def broadcast_replace_in_message
+      Rails.logger.info("[BROADCAST] ToolUse #{id} (#{name}) replacing, status: #{status}")
+      
       broadcast_replace_later_to(
         message.conversation,               # Stream name derived from the conversation
         target: self,                       # Target the tool_use partial itself by DOM ID
-        partial: "tool_uses/tool_use",      # The specific tool use partial
+        partial: "tool_uses/tool_use_nexrai", # Use the nexrai partial for consistency
         locals: { tool_use: self }
       )
+    rescue => e
+      Rails.logger.error("Error broadcasting tool use replace: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
     end
   end
 end

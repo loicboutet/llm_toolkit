@@ -1,5 +1,8 @@
 module LlmToolkit
   class Conversation < ApplicationRecord
+    # Include ActionView helpers needed for dom_id in broadcasts
+    include ActionView::RecordIdentifier
+    
     # Maximum size for tool results in conversation history (in characters)
     # Larger results will be truncated to prevent 413 errors
     MAX_TOOL_RESULT_SIZE = 50_000
@@ -34,6 +37,8 @@ module LlmToolkit
     if defined?(ApplicationRecord.broadcast_refreshes)
       broadcasts_refreshes
     end
+    
+    # Broadcast working indicator when status changes
 
     # Chat interface - send message and get response
     def chat(message, llm_model: nil, tools: nil, async: false)
@@ -233,6 +238,8 @@ module LlmToolkit
     end
 
     private
+    
+    # Broadcast working indicator update when status changes
 
     def get_default_provider
       if conversable.respond_to?(conversable.class.get_default_llm_provider_method)

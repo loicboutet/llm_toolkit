@@ -1,5 +1,8 @@
 module LlmToolkit
   class ToolResult < ApplicationRecord
+    # Include ActionView helpers needed for dom_id in broadcasts
+    include ActionView::RecordIdentifier
+    
     belongs_to :message, class_name: 'LlmToolkit::Message'
     belongs_to :tool_use, class_name: 'LlmToolkit::ToolUse'
     
@@ -27,12 +30,17 @@ module LlmToolkit
 
     # Broadcasts replacing the result container within the tool use partial
     def broadcast_to_tool_use
+      Rails.logger.info("[BROADCAST] ToolResult #{id} broadcasting to tool_use #{tool_use.id}")
+      
       broadcast_replace_later_to(
         message.conversation,               # Stream name derived from the conversation
         target: dom_id(tool_use, :result_container), # Target the container within the tool_use partial
         partial: "tool_results/tool_result", # The specific tool result partial
         locals: { tool_result: self }
       )
+    rescue => e
+      Rails.logger.error("Error broadcasting tool result: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
     end
   end
 end
