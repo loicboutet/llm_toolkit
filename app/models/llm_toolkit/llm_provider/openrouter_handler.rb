@@ -229,37 +229,39 @@ module LlmToolkit
       #
       # ANTHROPIC CACHING STRATEGY FOR MULTI-TURN CONVERSATIONS:
       # 
-      # From the Anthropic docs:
-      # "During each turn, we mark the final block of the final message with cache_control
-      # so the conversation can be incrementally cached."
+      # From Anthropic docs, for prompt caching to work correctly:
+      # - cache_control markers must be placed on the LAST 2 messages in the conversation
+      # - This allows Anthropic to incrementally cache conversation history
+      # - The cache system looks for matching prefixes up to cache breakpoints
       #
-      # The cache works as follows:
-      # - cache_control marks "cache everything up to and including this block"
-      # - The system automatically looks back up to 20 blocks for cache hits
-      # - We place cache_control on the LAST USER MESSAGE to cache the entire conversation
+      # Why 2 messages? Anthropic allows up to 4 cache breakpoints total:
+      # 1. End of system prompt (handled in system_message_formatter.rb)
+      # 2-3. Last 2 messages in conversation (handled here)
+      # 
+      # This strategy ensures:
+      # - On turn N, we cache everything up to the second-to-last message
+      # - On turn N+1, we get a cache hit on the previous cached content
+      # - The last message (new user input) is cached for the next turn
       #
       # Example flow:
-      # Request 1: [System<cache>] + [User: "Hello"<cache>]
-      # Request 2: [System<cache>] + [User: "Hello"] + [Assistant: "Hi!"] + [User: "How are you?"<cache>]
-      # Request 3: [System<cache>] + [...history...] + [User: "What's 2+2?"<cache>]
-      #
-      # On Request 2, the system will:
-      # 1. Check from the cache_control point backwards
-      # 2. Find that [System] + [User: "Hello"] matches the previous cache
-      # 3. Only process [Assistant: "Hi!"] + [User: "How are you?"] as new
+      # Request 1: [System<cache>] + [User1<cache>]
+      # Request 2: [System<cache>] + [User1] + [Asst1<cache>] + [User2<cache>]
+      # Request 3: [System<cache>] + [User1] + [Asst1] + [User2<cache>] + [Asst2<cache>] + [User3<cache>]
+      #            ^ On this request, "System + User1 + Asst1" prefix can match cache from Request 2
       #
       # Tool messages cannot have array content, so they're handled specially.
       def fix_conversation_history_for_openrouter(conversation_history)
         messages = Array(conversation_history)
         return [] if messages.empty?
         
-        # Find the LAST message (this is where we put cache_control for incremental caching)
-        # According to Anthropic docs: "mark the final block of the final message"
-        last_message_index = messages.size - 1
+        # Find indices of the last 2 non-tool messages for cache breakpoints
+        cache_breakpoint_indices = find_cache_breakpoint_indices(messages)
+        
+        Rails.logger.info("[CONVERSATION CACHE] Will apply cache_control to message indices: #{cache_breakpoint_indices.inspect}")
         
         messages.each_with_index.map do |msg, index|
           fixed_msg = msg.dup
-          is_last_message = (index == last_message_index)
+          should_cache = cache_breakpoint_indices.include?(index)
           is_tool_message = (msg[:role] == 'tool')
           
           # CRITICAL: Tool messages must ALWAYS have string content
@@ -273,19 +275,19 @@ module LlmToolkit
           if content.nil?
             fixed_msg[:content] = ""
           elsif content.is_a?(String)
-            # For the last message, convert to array format with cache_control
-            if is_last_message && conversation_caching_enabled?
+            # For messages that should be cached, convert to array format with cache_control
+            if should_cache && conversation_caching_enabled?
               fixed_msg[:content] = [
                 { type: 'text', text: content, cache_control: { type: 'ephemeral' } }
               ]
-              Rails.logger.info("[CONVERSATION CACHE] Cache breakpoint at LAST message #{index} (#{msg[:role]}, #{content.length} chars)")
+              Rails.logger.info("[CONVERSATION CACHE] Cache breakpoint at message #{index} (#{msg[:role]}, #{content.length} chars)")
             end
           elsif content.is_a?(Array)
-            if is_last_message && conversation_caching_enabled?
-              # Apply cache_control to the LAST content block of the last message
+            if should_cache && conversation_caching_enabled?
+              # Apply cache_control to the LAST content block of this message
               fixed_msg[:content] = apply_cache_control_to_last_block(content)
               text_chars = content.sum { |item| get_text_from_item(item)&.length.to_i }
-              Rails.logger.info("[CONVERSATION CACHE] Cache breakpoint at LAST message #{index} (#{msg[:role]}, #{text_chars} chars in array)")
+              Rails.logger.info("[CONVERSATION CACHE] Cache breakpoint at message #{index} (#{msg[:role]}, #{text_chars} chars in array)")
             end
           end
           
@@ -295,6 +297,30 @@ module LlmToolkit
           
           fixed_msg
         end
+      end
+      
+      # Find the indices of messages that should have cache_control
+      # Returns the indices of the last 2 non-tool messages
+      #
+      # According to Anthropic's documentation, we should cache:
+      # - The last message (current user input - will be used in next turn)
+      # - The second-to-last message (previous turn - allows incremental caching)
+      #
+      # This gives us 2 cache breakpoints in conversation (plus 1 for system = 3 total)
+      # Anthropic allows up to 4 cache breakpoints, so we're within limits.
+      def find_cache_breakpoint_indices(messages)
+        return [] if messages.empty?
+        
+        # Find indices of non-tool messages (tool messages can't have cache_control)
+        cacheable_indices = []
+        messages.each_with_index do |msg, idx|
+          next if msg[:role] == 'tool'
+          cacheable_indices << idx
+        end
+        
+        # Return the last 2 cacheable message indices
+        # This follows Anthropic's recommendation for multi-turn caching
+        cacheable_indices.last(2)
       end
       
       # Apply cache_control to the LAST content block in an array

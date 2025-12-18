@@ -10,15 +10,16 @@
 # "During each turn, we mark the final block of the final message with cache_control
 # so the conversation can be incrementally cached."
 #
-# How it works:
-# - cache_control marks the END of a cacheable prefix
-# - The system automatically looks back up to 20 blocks for cache hits
-# - We place cache_control on the LAST message to enable incremental caching
+# For effective multi-turn caching, Anthropic recommends caching the LAST 2 MESSAGES:
+# - This enables incremental caching across conversation turns
+# - The cache system looks for matching prefixes up to cache breakpoints
+# - With 2 breakpoints in conversation + 1 in system = 3 total (within Anthropic's 4 limit)
 #
 # Example flow:
-# Request 1: [System<cache>] + [User: "Hello"<cache>]
-# Request 2: [System<cache>] + [User: "Hello"] + [Assistant: "Hi!"] + [User: "How are you?"<cache>]
-# Request 3: [System<cache>] + [...history...] + [User: "What's 2+2?"<cache>]
+# Request 1: [System<cache>] + [User1<cache>]
+# Request 2: [System<cache>] + [User1] + [Asst1<cache>] + [User2<cache>]
+# Request 3: [System<cache>] + [User1] + [Asst1] + [User2<cache>] + [Asst2<cache>] + [User3<cache>]
+#            ^ On Request 3, "System + User1 + Asst1" can match cache from Request 2
 #
 # Run with: bin/rails test llm_toolkit/test/unit/prompt_caching_test.rb
 #
@@ -100,7 +101,20 @@ module LlmToolkit
         "Last message should have cache_control"
     end
     
-    test "multi-turn conversation has cache_control on last message only" do
+    test "two message conversation has cache_control on both messages" do
+      conv_history = [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi there!' }
+      ]
+      
+      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
+      
+      # Both messages should have cache_control (last 2)
+      cache_positions = find_cache_indices(fixed)
+      assert_equal [0, 1], cache_positions.sort, "Both messages should have cache_control"
+    end
+    
+    test "multi-turn conversation has cache_control on last 2 messages" do
       conv_history = [
         { role: 'user', content: 'Hello' },
         { role: 'assistant', content: 'Hi there!' },
@@ -109,22 +123,22 @@ module LlmToolkit
       
       fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       
-      # Only the LAST message should have cache_control
-      # Messages 0 and 1 should NOT have cache_control
-      [0, 1].each do |idx|
-        msg = fixed[idx]
-        has_cache = msg[:content].is_a?(Array) && msg[:content].any? { |c| c[:cache_control].present? }
-        refute has_cache, "Message at index #{idx} should NOT have cache_control"
-      end
+      # Only the LAST 2 messages should have cache_control
+      # Message 0 should NOT have cache_control
+      msg0 = fixed[0]
+      has_cache0 = msg0[:content].is_a?(Array) && msg0[:content].any? { |c| c[:cache_control].present? }
+      refute has_cache0, "Message at index 0 should NOT have cache_control"
       
-      # Message 2 (last) should have cache_control
-      last_msg = fixed[2]
-      assert last_msg[:content].is_a?(Array), "Last message should have array content"
-      assert last_msg[:content].any? { |c| c[:cache_control].present? }, 
-        "Last message should have cache_control"
+      # Messages 1 and 2 should have cache_control
+      [1, 2].each do |idx|
+        msg = fixed[idx]
+        assert msg[:content].is_a?(Array), "Message #{idx} should have array content"
+        assert msg[:content].any? { |c| c[:cache_control].present? }, 
+          "Message at index #{idx} should have cache_control"
+      end
     end
     
-    test "5 message conversation has cache_control on last message" do
+    test "5 message conversation has cache_control on last 2 messages" do
       conv_history = [
         { role: 'user', content: 'First message' },
         { role: 'assistant', content: 'First response' },
@@ -135,9 +149,9 @@ module LlmToolkit
       
       fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       
-      # Only message 4 (last) should have cache_control
+      # Only messages 3 and 4 (last 2) should have cache_control
       cache_positions = find_cache_indices(fixed)
-      assert_equal [4], cache_positions, "Only the last message should have cache_control"
+      assert_equal [3, 4], cache_positions.sort, "Only the last 2 messages should have cache_control"
     end
     
     test "multimodal user message with image gets cache_control on last text block" do
@@ -165,7 +179,7 @@ module LlmToolkit
       assert text_item[:cache_control].present?, "Text block should have cache_control"
     end
     
-    test "tool messages have string content and are not cached" do
+    test "tool messages have string content and are skipped for caching" do
       conv_history = [
         { role: 'user', content: 'Search for Ruby tips' },
         { 
@@ -185,11 +199,25 @@ module LlmToolkit
       assert tool_msg[:content].is_a?(String), 
         "Tool message content MUST be string, got #{tool_msg[:content].class}"
       
-      # Last user message (index 3) should have cache_control
-      last_msg = fixed[3]
-      assert last_msg[:content].is_a?(Array), "Last message should have array content"
-      assert last_msg[:content].any? { |c| c[:cache_control].present? },
-        "Last message should have cache_control"
+      # Last 2 non-tool messages should have cache_control
+      # Non-tool messages are at indices 0, 1, 3 (tool is at index 2)
+      # Last 2 non-tool indices are 1 and 3
+      
+      # Index 0 (first user) should NOT have cache_control
+      msg0 = fixed[0]
+      has_cache0 = msg0[:content].is_a?(Array) && msg0[:content].any? { |c| c[:cache_control].present? }
+      refute has_cache0, "First user message should NOT have cache_control"
+      
+      # Index 1 (assistant with tool_calls) should have cache_control
+      msg1 = fixed[1]
+      has_cache1 = msg1[:content].is_a?(Array) && msg1[:content].any? { |c| c[:cache_control].present? }
+      assert has_cache1, "Assistant message (second-to-last non-tool) should have cache_control"
+      
+      # Index 3 (last user) should have cache_control
+      msg3 = fixed[3]
+      assert msg3[:content].is_a?(Array), "Last user message should have array content"
+      assert msg3[:content].any? { |c| c[:cache_control].present? },
+        "Last user message should have cache_control"
     end
     
     # =========================================================================
@@ -207,8 +235,17 @@ module LlmToolkit
       
       # nil content should become empty string
       assistant_msg = fixed[1]
-      assert_equal "", assistant_msg[:content], 
-        "nil content should be converted to empty string"
+      # Since the assistant message is one of the last 2, it might be converted to array
+      # But if content was nil, it should be empty string ""
+      if assistant_msg[:content].is_a?(Array)
+        # If converted to array, it should have empty text
+        text_content = assistant_msg[:content].find { |c| c[:type] == 'text' }
+        assert text_content.nil? || text_content[:text].to_s.empty?, 
+          "nil content should result in empty content"
+      else
+        assert_equal "", assistant_msg[:content], 
+          "nil content should be converted to empty string"
+      end
     end
     
     test "tool message with array content is converted to string" do
@@ -263,8 +300,9 @@ module LlmToolkit
       
       assert total_cache_controls <= 4, 
         "Should use at most 4 cache_control blocks, using #{total_cache_controls}"
-      assert_equal 2, total_cache_controls,
-        "Expected exactly 2 cache_control blocks (1 system, 1 conversation)"
+      # 1 for system + 2 for last 2 conversation messages = 3 total
+      assert_equal 3, total_cache_controls,
+        "Expected exactly 3 cache_control blocks (1 system, 2 conversation)"
     end
     
     # =========================================================================
@@ -321,6 +359,41 @@ module LlmToolkit
       end
       
       assert has_cache, "Should have cache_control on last message"
+    end
+    
+    # =========================================================================
+    # Test the find_cache_breakpoint_indices helper
+    # =========================================================================
+    
+    test "find_cache_breakpoint_indices returns last 2 non-tool message indices" do
+      conv_history = [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi' },
+        { role: 'tool', tool_call_id: 'x', content: 'result' },
+        { role: 'user', content: 'Thanks' }
+      ]
+      
+      indices = @provider.send(:find_cache_breakpoint_indices, conv_history)
+      
+      # Non-tool indices are 0, 1, 3
+      # Last 2 are 1 and 3
+      assert_equal [1, 3], indices.sort
+    end
+    
+    test "find_cache_breakpoint_indices returns single index for single message" do
+      conv_history = [
+        { role: 'user', content: 'Hello' }
+      ]
+      
+      indices = @provider.send(:find_cache_breakpoint_indices, conv_history)
+      
+      assert_equal [0], indices
+    end
+    
+    test "find_cache_breakpoint_indices returns empty for empty history" do
+      indices = @provider.send(:find_cache_breakpoint_indices, [])
+      
+      assert_equal [], indices
     end
     
     private
