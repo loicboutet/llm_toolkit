@@ -4,12 +4,6 @@ require 'turbo-rails'
 module LlmToolkit
   class CallStreamingLlmWithToolService
     include LlmToolkit::CancellationCheck
-    
-    # Placeholder markers to detect "thinking" messages
-    PLACEHOLDER_MARKERS = [
-      "🤔 Traitement de votre demande...",
-      "🎯 Analyse automatique en cours..."
-    ].freeze
 
     attr_reader :llm_model, :llm_provider, :conversation, :assistant_message, :conversable, :role, :tools, :user_id, :tool_classes, :broadcast_to
 
@@ -42,7 +36,7 @@ module LlmToolkit
       
       # Check if the initial content is a placeholder that should be cleared
       initial_content = @current_message.content || ""
-      @is_placeholder_content = PLACEHOLDER_MARKERS.any? { |marker| initial_content.include?(marker) }
+      @is_placeholder_content = LlmToolkit.config.placeholder_content?(initial_content)
       
       # If it's a placeholder, start with empty content (will be replaced on first chunk)
       # Otherwise, keep the existing content for appending
@@ -56,9 +50,9 @@ module LlmToolkit
       @tool_results_pending = false
       @finish_reason = nil
       
-      # Add followup count to prevent infinite loops
+      # Add followup count to prevent infinite loops - use config value
       @followup_count = 0
-      @max_followups = 100 # Safety limit
+      @max_followups = LlmToolkit.config.max_tool_followups
 
       # Track the last error to avoid repeated error messages
       @last_error = nil

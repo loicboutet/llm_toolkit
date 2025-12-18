@@ -2,6 +2,7 @@ module LlmToolkit
   class LlmProvider < ApplicationRecord
     include SystemMessageFormatter
     include OpenrouterHandler
+    include AnthropicHandler
     
     belongs_to :owner, polymorphic: true
     has_many :llm_models, dependent: :destroy, class_name: 'LlmToolkit::LlmModel', foreign_key: 'llm_provider_id'
@@ -39,7 +40,7 @@ module LlmToolkit
       end
     end
     
-    # Stream chat implementation for OpenRouter
+    # Stream chat implementation - supports both Anthropic and OpenRouter
     # Accepts a block that will be called with each chunk of the streamed response
     # @param system_messages [Array<Hash>] System messages for the LLM
     # @param conversation_history [Array<Hash>] Previous messages in the conversation
@@ -51,11 +52,6 @@ module LlmToolkit
       target_llm_model = llm_model || default_llm_model
       raise ApiError, "No suitable LLM model found for provider #{name}" unless target_llm_model
 
-      # Validate provider type - currently only supporting OpenRouter
-      unless provider_type == 'openrouter'
-        raise ApiError, "Streaming is only supported for OpenRouter provider type"
-      end
-
       # Ensure we have valid arrays
       system_messages = Array(system_messages)
       conversation_history = Array(conversation_history)
@@ -64,8 +60,20 @@ module LlmToolkit
       # Validate tools format
       validate_tools_format(tools)
       
-      # Stream response from OpenRouter
-      stream_openrouter(target_llm_model, system_messages, conversation_history, tools, &block)
+      case provider_type
+      when 'anthropic'
+        stream_anthropic(target_llm_model, system_messages, conversation_history, tools, &block)
+      when 'openrouter'
+        stream_openrouter(target_llm_model, system_messages, conversation_history, tools, &block)
+      else
+        raise ApiError, "Streaming not supported for provider type: #{provider_type}"
+      end
+    end
+    
+    # Check if this provider supports streaming
+    # @return [Boolean] True if streaming is supported
+    def supports_streaming?
+      %w[anthropic openrouter].include?(provider_type)
     end
 
     # Finds the default LlmModel for this provider

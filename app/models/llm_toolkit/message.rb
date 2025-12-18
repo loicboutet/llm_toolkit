@@ -2,6 +2,8 @@ module LlmToolkit
   class Message < ApplicationRecord
     include ActionView::RecordIdentifier
     
+    MESSAGES_PER_PAGE = 30
+    
     belongs_to :conversation, touch: true
     belongs_to :llm_model, class_name: 'LlmToolkit::LlmModel', optional: true
     has_many :tool_uses, class_name: 'LlmToolkit::ToolUse', dependent: :destroy
@@ -27,9 +29,10 @@ module LlmToolkit
     end
     
     def broadcast_message_complete
-      Rails.logger.info("[BROADCAST] Message #{id} complete (tokens: #{prompt_tokens}), broadcasting full frame and header stats")
+      Rails.logger.info("[BROADCAST] Message #{id} complete (tokens: #{prompt_tokens}), broadcasting full frame, header stats, and form")
       broadcast_full_frame
       broadcast_header_stats
+      broadcast_form_update
     rescue => e
       Rails.logger.error("Error broadcasting message complete: #{e.message}")
       Rails.logger.error(e.backtrace.first(5).join("\n"))
@@ -37,17 +40,39 @@ module LlmToolkit
     
     # Broadcast the full conversation messages frame
     # Messages in CHRONOLOGICAL order (oldest first, newest at bottom)
+    # WITH PAGINATION to avoid scroll issues
     def broadcast_full_frame
-      all_messages = conversation.messages
-                                  .includes(tool_uses: :tool_result, attachments_attachments: :blob)
-                                  .order(created_at: :asc)
-                                  .to_a
+      total_count = conversation.messages.count
+      
+      if total_count > MESSAGES_PER_PAGE
+        # Load only the most recent messages
+        all_messages = conversation.messages
+                                    .includes(tool_uses: :tool_result, attachments_attachments: :blob)
+                                    .order(created_at: :asc)
+                                    .offset(total_count - MESSAGES_PER_PAGE)
+                                    .limit(MESSAGES_PER_PAGE)
+                                    .to_a
+        has_more = true
+        oldest_id = all_messages.first&.id
+      else
+        all_messages = conversation.messages
+                                    .includes(tool_uses: :tool_result, attachments_attachments: :blob)
+                                    .order(created_at: :asc)
+                                    .to_a
+        has_more = false
+        oldest_id = all_messages.first&.id
+      end
 
       broadcast_replace_to(
         conversation,
         target: "conversation_messages_frame",
         partial: "conversations/conversation_messages_frame",
-        locals: { messages: all_messages }
+        locals: { 
+          messages: all_messages,
+          has_more_messages: has_more,
+          oldest_loaded_id: oldest_id,
+          conversation: conversation
+        }
       )
     end
     
@@ -60,6 +85,25 @@ module LlmToolkit
       )
     rescue => e
       Rails.logger.error("Error broadcasting header stats: #{e.message}")
+    end
+    
+    # Broadcast form update to switch between Cancel/Send button
+    def broadcast_form_update
+      conv = conversation.reload
+      selected_llm_model_id = determine_selected_llm_model_id
+      form_partial, form_locals = determine_form_partial_and_locals(conv, selected_llm_model_id)
+      
+      Rails.logger.info("[BROADCAST] Form update - partial: #{form_partial}, status: #{conv.status}")
+      
+      broadcast_replace_to(
+        conv,
+        target: "message_form_frame",
+        partial: form_partial,
+        locals: form_locals
+      )
+    rescue => e
+      Rails.logger.error("Error broadcasting form update: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
     end
     
     def broadcast_content_update_throttled
@@ -281,6 +325,41 @@ module LlmToolkit
     end
     
     private
+    
+    def determine_selected_llm_model_id
+      last_assistant = conversation.messages
+                                   .where(role: 'assistant')
+                                   .where.not(llm_model_id: nil)
+                                   .order(created_at: :desc)
+                                   .first
+      
+      return last_assistant.llm_model_id if last_assistant&.llm_model_id
+      LlmToolkit::LlmModel.ordered.first&.id
+    end
+    
+    def determine_form_partial_and_locals(conv, selected_llm_model_id)
+      conversable = conv.conversable
+      
+      # Check class name as string to avoid loading issues
+      case conversable.class.name
+      when 'AppUser'
+        app = conversable.app
+        [
+          "app_conversations/message_form",
+          { app: app, conversation: conv, selected_llm_model_id: selected_llm_model_id }
+        ]
+      when 'Assistant'
+        [
+          "assistant_conversations/message_form",
+          { assistant: conversable, conversation: conv, selected_llm_model_id: selected_llm_model_id }
+        ]
+      else
+        [
+          "conversations/message_form",
+          { conversation: conv, selected_llm_model_id: selected_llm_model_id }
+        ]
+      end
+    end
     
     def extract_reasoning_text_from_details
       return nil if reasoning_details.blank?

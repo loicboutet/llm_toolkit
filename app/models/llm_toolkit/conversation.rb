@@ -2,10 +2,6 @@ module LlmToolkit
   class Conversation < ApplicationRecord
     # Include ActionView helpers needed for dom_id in broadcasts
     include ActionView::RecordIdentifier
-    
-    # Maximum size for tool results in conversation history (in characters)
-    # Larger results will be truncated to prevent 413 errors
-    MAX_TOOL_RESULT_SIZE = 50_000
 
     belongs_to :conversable, polymorphic: true, touch: true
     belongs_to :canceled_by, polymorphic: true, optional: true
@@ -37,20 +33,19 @@ module LlmToolkit
     if defined?(ApplicationRecord.broadcast_refreshes)
       broadcasts_refreshes
     end
-    
-    # Broadcast working indicator when status changes
 
     # Chat interface - send message and get response
-    def chat(message, llm_model: nil, tools: nil, async: false)
+    def chat(message, llm_model: nil, tools: nil, async: false, user_id: nil)
       update(status: :working)
       target_llm_model = llm_model || get_default_llm_model
       llm_provider = target_llm_model.llm_provider
       tool_classes = tools || get_default_tools
+      resolved_user_id = user_id || Thread.current[:current_user_id]
       
       user_message = messages.create!(
         role: 'user',
         content: message,
-        user_id: Thread.current[:current_user_id]
+        user_id: resolved_user_id
       )
       
       if async
@@ -59,7 +54,7 @@ module LlmToolkit
           target_llm_model.id,
           tool_classes.map(&:name),
           self.agent_type,
-          Thread.current[:current_user_id]
+          resolved_user_id
         )
         return true
       else
@@ -67,37 +62,37 @@ module LlmToolkit
           llm_model: target_llm_model,
           conversation: self,
           tool_classes: tool_classes,
-          user_id: Thread.current[:current_user_id]
+          user_id: resolved_user_id
         )
         result = service.call
         messages.where(role: 'assistant').order(created_at: :desc).first if result
       end
     end
 
-    # Streaming chat interface
-    def stream_chat(message, llm_model: nil, tools: nil, broadcast_to: nil, async: true)
+    # Streaming chat interface - works with both Anthropic and OpenRouter providers
+    def stream_chat(message, llm_model: nil, tools: nil, broadcast_to: nil, async: true, user_id: nil)
       target_llm_model = llm_model || get_default_llm_model
       llm_provider = target_llm_model.llm_provider
 
-      unless llm_provider.provider_type == 'openrouter'
-        raise ArgumentError, "stream_chat only works with OpenRouter providers"
+      unless llm_provider.supports_streaming?
+        raise ArgumentError, "stream_chat requires a provider that supports streaming (anthropic or openrouter)"
       end
 
       update(status: :working)
       tool_classes = tools || get_default_tools
+      resolved_user_id = user_id || Thread.current[:current_user_id]
       
       user_message = messages.create!(
         role: 'user',
         content: message,
-        user_id: Thread.current[:current_user_id]
+        user_id: resolved_user_id
       )
       
       if async
         LlmToolkit::CallStreamingLlmJob.perform_later(
           id,
           target_llm_model.id,
-          self.agent_type,
-          Thread.current[:current_user_id],
+          resolved_user_id,
           tool_classes.map(&:name),
           broadcast_to
         )
@@ -107,19 +102,19 @@ module LlmToolkit
           llm_model: target_llm_model,
           conversation: self,
           tool_classes: tool_classes,
-          user_id: Thread.current[:current_user_id]
+          user_id: resolved_user_id
         )
         result = service.call
         messages.where(role: 'assistant').order(created_at: :desc).first if result
       end
     end
 
-    def chat_async(message, llm_model: nil, tools: nil)
-      chat(message, llm_model: llm_model, tools: tools, async: true)
+    def chat_async(message, llm_model: nil, tools: nil, user_id: nil)
+      chat(message, llm_model: llm_model, tools: tools, async: true, user_id: user_id)
     end
 
-    def stream_chat_async(message, llm_model: nil, tools: nil, broadcast_to: nil)
-      stream_chat(message, llm_model: llm_model, tools: tools, broadcast_to: broadcast_to, async: true)
+    def stream_chat_async(message, llm_model: nil, tools: nil, broadcast_to: nil, user_id: nil)
+      stream_chat(message, llm_model: llm_model, tools: tools, broadcast_to: broadcast_to, async: true, user_id: user_id)
     end
 
     def working?
@@ -221,10 +216,7 @@ module LlmToolkit
       end
 
       # Filter out empty messages, but NEVER filter out 'tool' messages
-      # Tool messages are required by the API even if their content is empty
-      # This prevents "tool_use ids were found without corresponding tool_result" errors
       return history_messages.reject do |msg|
-        # Never reject tool messages - they are required for API compliance
         next false if msg[:role] == 'tool'
         
         is_empty_non_user = msg[:role] != 'user' && msg[:content].blank? && msg[:tool_calls].blank?
@@ -238,8 +230,6 @@ module LlmToolkit
     end
 
     private
-    
-    # Broadcast working indicator update when status changes
 
     def get_default_provider
       if conversable.respond_to?(conversable.class.get_default_llm_provider_method)
@@ -284,12 +274,8 @@ module LlmToolkit
           input: tool_use.input
         }
 
-        # IMPORTANT: Always add a tool_result, even if there was an error or no result
-        # This prevents "tool_use ids were found without corresponding tool_result" errors
         if tool_result = tool_use.tool_result
           is_error_value = tool_result.is_error.nil? ? false : !!tool_result.is_error
-          
-          # Sanitize tool result content to prevent oversized payloads
           sanitized_content = sanitize_tool_result_content(tool_result.content, tool_use.name)
           
           messages << {
@@ -302,8 +288,6 @@ module LlmToolkit
             }]
           }
         else
-          # No tool_result exists - create a synthetic error result to maintain API compliance
-          # This happens when tool execution fails, times out, or the conversation was interrupted
           Rails.logger.warn("Tool use #{tool_use.id} (#{tool_use.name}) has no tool_result - creating synthetic error response")
           messages << {
             role: "user",
@@ -363,13 +347,9 @@ module LlmToolkit
           }
         }
 
-        # IMPORTANT: Always add a tool result message for every tool call
-        # This prevents "tool_use ids were found without corresponding tool_result" errors
-        # from the Anthropic API (via OpenRouter)
         if tool_result = tool_use.tool_result
           tool_result_content = tool_result.content.to_s
           
-          # Clean up Ruby hash notation if present
           if tool_result_content.include?('=>') && tool_result_content.strip.start_with?('{') && tool_result_content.strip.end_with?('}')
              begin
                parsed = JSON.parse(tool_result_content)
@@ -386,15 +366,9 @@ module LlmToolkit
              end
           end
           
-          # Check if this is a screenshot tool result with image data
-          # If so, we need to extract the image and add it as a multimodal user message
           image_data = extract_image_from_tool_result(tool_result_content, tool_use.name)
-          
-          # Sanitize tool result content to prevent oversized payloads
-          # This will remove the base64 image data from the text content
           tool_result_content = sanitize_tool_result_content(tool_result_content, tool_use.name)
           
-          # Ensure we never send empty content - provide a fallback message
           if tool_result_content.blank?
             tool_result_content = "[Tool completed with empty response]"
           end
@@ -406,14 +380,11 @@ module LlmToolkit
             content: tool_result_content
           }
           
-          # If we extracted an image, add a user message with the image as multimodal content
-          # This allows vision-capable models to actually SEE the screenshot
           if image_data
             Rails.logger.info("📸 Adding screenshot image to conversation for tool #{tool_use.name}")
             tool_result_messages << create_image_user_message(image_data, tool_use.name)
           end
         else
-          # No tool_result exists - create a synthetic error result to maintain API compliance
           Rails.logger.warn("Tool use #{tool_use.id} (#{tool_use.name}) has no tool_result - creating synthetic error response for OpenRouter")
           
           error_message = case tool_use.status
@@ -442,14 +413,11 @@ module LlmToolkit
       messages
     end
 
-    # Extract base64 image data from tool result content if present
-    # Returns the base64 data URL or nil if no image found
     def extract_image_from_tool_result(content, tool_name)
       return nil if content.blank?
       
       content_str = content.to_s
       
-      # Only extract images from screenshot-related tools
       screenshot_tools = %w[
         lovelace_browser_screenshot
         lovelace_browser_get_state
@@ -458,18 +426,14 @@ module LlmToolkit
       
       return nil unless screenshot_tools.include?(tool_name)
       
-      # Pattern 1: Ruby hash notation with :data key
-      # {:result=>{:type=>"image_base64", :data=>"iVBORw0KGgo..."}}
       if match = content_str.match(/:data\s*=>\s*"([A-Za-z0-9+\/=]+)"/)
         base64_data = match[1]
-        if base64_data.length > 100  # Sanity check - real images are much larger
+        if base64_data.length > 100
           Rails.logger.info("📸 Extracted image from Ruby hash notation (#{base64_data.length} chars)")
           return "data:image/png;base64,#{base64_data}"
         end
       end
       
-      # Pattern 2: JSON format with "data" key
-      # {"result":{"type":"image_base64","data":"iVBORw0KGgo..."}}
       if match = content_str.match(/"data"\s*:\s*"([A-Za-z0-9+\/=]+)"/)
         base64_data = match[1]
         if base64_data.length > 100
@@ -478,7 +442,6 @@ module LlmToolkit
         end
       end
       
-      # Pattern 3: Already a data URL
       if match = content_str.match(/(data:image\/[a-z]+;base64,[A-Za-z0-9+\/=]+)/)
         data_url = match[1]
         if data_url.length > 100
@@ -490,7 +453,6 @@ module LlmToolkit
       nil
     end
 
-    # Create a user message with the screenshot image for multimodal models
     def create_image_user_message(image_data_url, tool_name)
       {
         role: "user",
@@ -509,18 +471,13 @@ module LlmToolkit
       }
     end
 
-    # Sanitize tool result content to prevent oversized payloads (413 errors)
-    # - Removes base64 image data and replaces with a summary
-    # - Truncates overly long results
     def sanitize_tool_result_content(content, tool_name)
       return content if content.blank?
       
       content_str = content.to_s
+      max_size = LlmToolkit.config.max_tool_result_size
       
-      # Check for base64 image data patterns - remove the large binary data
-      # The image will be sent separately as a multimodal message
       if content_str.include?('image_base64') || content_str.include?('data:image')
-        # Extract the message part if it exists, remove the base64 data
         if content_str =~ /:message\s*=>\s*"([^"]+)"/
           return "[Screenshot captured successfully] #{$1}"
         elsif content_str =~ /"message"\s*:\s*"([^"]+)"/
@@ -530,15 +487,13 @@ module LlmToolkit
         end
       end
       
-      # Check for base64 PDF data
       if content_str.include?('data:application/pdf;base64')
         return "[PDF content processed - base64 data removed for brevity]"
       end
       
-      # Truncate if still too large
-      if content_str.length > MAX_TOOL_RESULT_SIZE
-        Rails.logger.warn("Truncating large tool result for #{tool_name}: #{content_str.length} chars -> #{MAX_TOOL_RESULT_SIZE} chars")
-        return content_str[0...MAX_TOOL_RESULT_SIZE] + "\n\n[... content truncated due to size ...]"
+      if content_str.length > max_size
+        Rails.logger.warn("Truncating large tool result for #{tool_name}: #{content_str.length} chars -> #{max_size} chars")
+        return content_str[0...max_size] + "\n\n[... content truncated due to size ...]"
       end
       
       content_str
