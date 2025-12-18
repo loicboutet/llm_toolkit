@@ -21,12 +21,9 @@ module LlmToolkit
 
       return unless conversation && original_llm_model
 
-      # Skip if conversation is already being processed by another mechanism
-      # This is a secondary guard in case the concurrency limit doesn't catch it
-      if conversation.working?
-        Rails.logger.info("⏭️ Skipping job - conversation #{conversation_id} is already working")
-        return
-      end
+      # Note: We no longer skip if conversation is "working" because the controller
+      # now sets the status to "working" before enqueueing the job (for cancel button UX).
+      # The limits_concurrency directive ensures only one job runs at a time per conversation.
 
       # Ensure tool_class_names is an array before mapping
       safe_tool_class_names = Array(tool_class_names)

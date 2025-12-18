@@ -3,6 +3,8 @@ require 'turbo-rails'
 
 module LlmToolkit
   class CallStreamingLlmWithToolService
+    include LlmToolkit::CancellationCheck
+    
     # Placeholder markers to detect "thinking" messages
     PLACEHOLDER_MARKERS = [
       "🤔 Traitement de votre demande...",
@@ -87,6 +89,11 @@ module LlmToolkit
         Rails.logger.info("[STREAMING SERVICE] stream_llm completed normally")
 
         true
+      rescue CancellationError => e
+        # Handle cancellation gracefully
+        Rails.logger.info("[STREAMING SERVICE] Conversation #{@conversation.id} was cancelled: #{e.message}")
+        handle_cancellation
+        false
       rescue => e
         Rails.logger.error("Error in CallStreamingLlmWithToolService: #{e.message}")
         Rails.logger.error(e.backtrace.join("\n"))
@@ -108,9 +115,32 @@ module LlmToolkit
     end
 
     private
+    
+    # Handle cancellation by cleaning up and marking the message
+    def handle_cancellation
+      if @current_message
+        # If message has content, append cancellation notice
+        if @current_message.content.present?
+          @current_message.update(
+            content: @current_message.content + "\n\n[Conversation annulée par l'utilisateur]",
+            finish_reason: 'cancelled'
+          )
+        else
+          @current_message.update(
+            content: "[Conversation annulée par l'utilisateur]",
+            finish_reason: 'cancelled'
+          )
+        end
+      end
+      
+      @conversation.update(status: :resting)
+    end
 
     # Stream responses from the LLM and process chunks
     def stream_llm
+      # Check for cancellation before starting
+      check_cancellation!(@conversation)
+      
       # Get system prompt
       sys_prompt = if @conversable.respond_to?(:generate_system_messages)
                      @conversable.generate_system_messages(@role)
@@ -127,10 +157,22 @@ module LlmToolkit
       
       Rails.logger.info("[STREAM_LLM] Starting stream_chat call")
       
+      # Track chunk count for periodic cancellation checks
+      chunk_count = 0
+      
       # Call the LLM provider with streaming and handle each chunk
       final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model: @llm_model) do |chunk|
+        # Check for cancellation every 10 chunks to avoid too many DB queries
+        chunk_count += 1
+        if (chunk_count % 10).zero?
+          check_cancellation!(@conversation)
+        end
+        
         process_chunk(chunk)
       end
+
+      # Final cancellation check after streaming completes
+      check_cancellation!(@conversation)
 
       Rails.logger.info("[STREAM_LLM] stream_chat returned, tool_results_pending=#{@tool_results_pending}")
 
@@ -308,6 +350,9 @@ module LlmToolkit
 
     # Make a follow-up call to the LLM with the tool results
     def followup_with_tools
+      # Check for cancellation before followup
+      check_cancellation!(@conversation)
+      
       # Reload conversation to get latest status
       @conversation.reload
       
@@ -348,12 +393,24 @@ module LlmToolkit
       
       # IMPORTANT: Capture the message for this followup BEFORE streaming
       message_for_usage = @current_message
+      
+      # Track chunk count for periodic cancellation checks
+      chunk_count = 0
 
       begin
         # Call the LLM provider with streaming and handle each chunk
         final_response = @llm_provider.stream_chat(sys_prompt, conv_history, @tools, llm_model: @llm_model) do |chunk|
+          # Check for cancellation every 10 chunks
+          chunk_count += 1
+          if (chunk_count % 10).zero?
+            check_cancellation!(@conversation)
+          end
+          
           process_chunk(chunk)
         end
+        
+        # Final cancellation check after streaming
+        check_cancellation!(@conversation)
 
         Rails.logger.info("[FOLLOWUP] stream_chat returned, tool_results_pending=#{@tool_results_pending}")
 
@@ -407,6 +464,9 @@ module LlmToolkit
         
         Rails.logger.info("[FOLLOWUP] Followup ##{@followup_count} completed without needing further followup")
         
+      rescue CancellationError => e
+        Rails.logger.info("[FOLLOWUP] Cancelled during followup: #{e.message}")
+        raise # Re-raise to be handled by the main call method
       rescue => e
         error_message = "Error in followup call: #{e.message}"
         Rails.logger.error(error_message)
@@ -777,4 +837,7 @@ module LlmToolkit
       )
     end
   end
+  
+  # Custom error for cancellation
+  class CancellationError < StandardError; end
 end
