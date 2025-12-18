@@ -29,10 +29,21 @@ module LlmToolkit
     end
     
     def broadcast_message_complete
-      Rails.logger.info("[BROADCAST] Message #{id} complete (tokens: #{prompt_tokens}), broadcasting full frame, header stats, and form")
+      Rails.logger.info("[BROADCAST] Message #{id} complete (tokens: #{prompt_tokens}), broadcasting full frame and header stats")
       broadcast_full_frame
       broadcast_header_stats
-      broadcast_form_update
+      
+      # Only broadcast form update if conversation is NOT currently working
+      # When conversation is working, the form should stay in "cancel" mode
+      # The Conversation#broadcast_form_update_on_status_change callback will
+      # broadcast the correct form state when status changes to resting
+      conv = conversation.reload
+      unless conv.status_working?
+        Rails.logger.info("[BROADCAST] Conversation not working (status: #{conv.status}), broadcasting form update")
+        broadcast_form_update
+      else
+        Rails.logger.info("[BROADCAST] Conversation still working, skipping form update (will be handled by status change callback)")
+      end
     rescue => e
       Rails.logger.error("Error broadcasting message complete: #{e.message}")
       Rails.logger.error(e.backtrace.first(5).join("\n"))

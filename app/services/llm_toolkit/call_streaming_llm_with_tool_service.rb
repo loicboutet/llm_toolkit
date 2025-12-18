@@ -104,11 +104,95 @@ module LlmToolkit
         Rails.logger.info("[STREAMING SERVICE] Entering ensure block, tool_results_pending=#{@tool_results_pending}")
         # Set conversation status to resting when done, unless waiting for approval
         @conversation.reload
-        @conversation.update(status: :resting) unless @conversation.status_waiting?
+        unless @conversation.status_waiting?
+          @conversation.update(status: :resting)
+          # Explicitly broadcast form update since the callback may not trigger
+          # (due to reload clearing change tracking or status already being resting)
+          broadcast_form_update_after_completion
+        end
       end
     end
 
     private
+    
+    # Broadcast form update after conversation completes
+    # This ensures the form switches from Cancel to Send button
+    def broadcast_form_update_after_completion
+      Rails.logger.info("[STREAMING SERVICE] Broadcasting form update for conversation #{@conversation.id}")
+      
+      selected_llm_model_id = determine_selected_llm_model_id
+      partial_info = determine_form_partial(selected_llm_model_id)
+      
+      return unless partial_info
+      
+      Turbo::StreamsChannel.broadcast_replace_to(
+        @conversation,
+        target: "message_form_frame",
+        partial: partial_info[:partial],
+        locals: partial_info[:locals]
+      )
+      
+      Rails.logger.info("[STREAMING SERVICE] Form broadcast sent for conversation #{@conversation.id}")
+    rescue => e
+      Rails.logger.error("[STREAMING SERVICE] Error broadcasting form update: #{e.message}")
+      Rails.logger.error(e.backtrace.first(5).join("\n"))
+    end
+    
+    # Determine which form partial to use based on the conversable type
+    def determine_form_partial(selected_llm_model_id)
+      case @conversable
+      when User
+        {
+          partial: "conversations/message_form",
+          locals: { 
+            conversation: @conversation, 
+            selected_llm_model_id: selected_llm_model_id 
+          }
+        }
+      when Assistant
+        {
+          partial: "assistant_conversations/message_form",
+          locals: { 
+            assistant: @conversable,
+            conversation: @conversation, 
+            selected_llm_model_id: selected_llm_model_id 
+          }
+        }
+      when App
+        {
+          partial: "app_conversations/message_form",
+          locals: { 
+            app: @conversable,
+            conversation: @conversation, 
+            selected_llm_model_id: selected_llm_model_id 
+          }
+        }
+      else
+        # Try to handle other conversable types generically
+        if @conversable.class.name == 'AppUser'
+          app = @conversable.app
+          {
+            partial: "app_conversations/message_form",
+            locals: { 
+              app: app,
+              conversation: @conversation, 
+              selected_llm_model_id: selected_llm_model_id 
+            }
+          }
+        else
+          Rails.logger.warn("[STREAMING SERVICE] Unknown conversable type: #{@conversable.class.name}")
+          nil
+        end
+      end
+    end
+    
+    # Get default LLM model ID for the conversation
+    def determine_selected_llm_model_id
+      last_assistant_message = @conversation.messages.where(role: 'assistant').order(created_at: :desc).first
+      return last_assistant_message.llm_model_id if last_assistant_message&.llm_model_id.present?
+      
+      LlmToolkit::LlmModel.ordered.first&.id
+    end
     
     # Handle cancellation by cleaning up and marking the message
     def handle_cancellation
