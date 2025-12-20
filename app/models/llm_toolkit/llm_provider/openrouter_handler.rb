@@ -117,8 +117,7 @@ module LlmToolkit
           finish_reason: nil,
           json_buffer: "",
           generation_id: nil,
-          api_error: nil,
-          error_handled_via_stream: false
+          api_error: nil
         }
 
         response = client.post('chat/completions') do |req|
@@ -133,30 +132,10 @@ module LlmToolkit
         
         process_remaining_buffer(streaming_state, &block)
         
-        # Only raise an exception if we haven't already handled the error via streaming
-        # When error_handled_via_stream is true, the error message was already sent to the UI
-        # and re-raising would cause duplicate error handling
         unless (200..299).cover?(response.status)
-          if streaming_state[:error_handled_via_stream]
-            Rails.logger.info("OpenRouter API error already handled via streaming, not re-raising")
-            # Return a minimal response indicating error was handled
-            return {
-              'content' => '',
-              'model' => streaming_state[:model_name],
-              'role' => 'assistant',
-              'stop_reason' => 'error',
-              'stop_sequence' => nil,
-              'tool_calls' => [],
-              'usage' => streaming_state[:usage_info],
-              'finish_reason' => 'error',
-              'generation_id' => streaming_state[:generation_id],
-              'error_handled' => true
-            }
-          else
-            error_detail = streaming_state[:api_error] || "Status #{response.status}"
-            Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
-            raise ApiError, "API streaming error: #{error_detail}"
-          end
+          error_detail = streaming_state[:api_error] || "Status #{response.status}"
+          Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
+          raise ApiError, "API streaming error: #{error_detail}"
         end
         
         formatted_tool_calls = format_tools_response_from_openrouter(streaming_state[:tool_calls]) if streaming_state[:tool_calls].any?
@@ -270,38 +249,35 @@ module LlmToolkit
       
       # Fix conversation history for OpenRouter API compatibility
       #
-      # SIMPLE CACHING STRATEGY (v4):
+      # CACHING STRATEGY:
       # 
-      # Just cache the LAST non-tool message. That's it.
+      # Put cache_control on the LAST non-tool message WITH ACTUAL CONTENT.
+      # 
+      # Why "with content"? Because assistant messages that trigger tool calls
+      # often have empty content (just tool_calls array). Caching an empty
+      # message doesn't cache anything useful!
       #
-      # Why this works:
-      # - cache_control marks "cache everything UP TO here"
-      # - Each request's last message creates a cache of the ENTIRE prefix
-      # - Next request hits that cache for the prefix, adds new content
+      # Example of the problem:
+      #   msg[24]: user "do something" (50 chars)
+      #   msg[25]: assistant "" + tool_calls  <- EMPTY CONTENT!
+      #   msg[26]: tool result
       #
-      # Example:
-      #   Request 1: [System<c>] [User1<c>]           → caches System+User1
-      #   Request 2: [System<c>] [User1] [A1] [U2<c>] → HITS prefix, caches more
-      #   Request 3: [System<c>] [User1] [A1] [U2] [A2] [U3<c>] → HITS prefix, caches more
-      #
-      # Tool messages can't have cache_control, so we find the last NON-tool message.
+      # Old code would cache msg[25] with 0 chars = useless.
+      # New code caches msg[24] with 50 chars = caches the prefix!
       def fix_conversation_history_for_openrouter(conversation_history)
         messages = Array(conversation_history)
         return [] if messages.empty?
         
-        # Find the last non-tool message index
-        last_non_tool_idx = nil
-        messages.each_with_index do |msg, idx|
-          last_non_tool_idx = idx unless msg[:role] == 'tool'
-        end
+        # Find the last non-tool message WITH ACTUAL CONTENT
+        cache_target_idx = find_last_cacheable_message_index(messages)
         
-        Rails.logger.info("[CONVERSATION CACHE] Strategy: cache LAST non-tool message only")
-        Rails.logger.info("[CONVERSATION CACHE] Last non-tool message index: #{last_non_tool_idx}")
+        Rails.logger.info("[CONVERSATION CACHE] Strategy: cache LAST non-tool message WITH CONTENT")
+        Rails.logger.info("[CONVERSATION CACHE] Cache target message index: #{cache_target_idx || 'NONE'}")
         
         messages.each_with_index.map do |msg, index|
           fixed_msg = msg.dup
           is_tool_message = (msg[:role] == 'tool')
-          should_cache = (index == last_non_tool_idx) && conversation_caching_enabled?
+          should_cache = (index == cache_target_idx) && conversation_caching_enabled?
           
           # Tool messages must have string content
           if is_tool_message
@@ -334,6 +310,46 @@ module LlmToolkit
           
           fixed_msg
         end
+      end
+      
+      # Find the last message that:
+      # 1. Is NOT a tool message
+      # 2. HAS actual text content (not empty)
+      #
+      # This ensures we cache something meaningful, not an empty tool-call container
+      def find_last_cacheable_message_index(messages)
+        last_idx = nil
+        
+        messages.each_with_index do |msg, idx|
+          # Skip tool messages
+          next if msg[:role] == 'tool'
+          
+          # Check if message has actual content
+          content = msg[:content]
+          has_content = false
+          
+          if content.is_a?(String)
+            has_content = content.present? && content.strip.length > 0
+          elsif content.is_a?(Array)
+            has_content = content.any? { |item| 
+              text = get_text_from_item(item)
+              text.present? && text.strip.length > 0
+            }
+          end
+          
+          # Update last_idx if this message has content
+          last_idx = idx if has_content
+        end
+        
+        # If no message with content found, fall back to last non-tool message
+        if last_idx.nil?
+          messages.each_with_index do |msg, idx|
+            last_idx = idx unless msg[:role] == 'tool'
+          end
+          Rails.logger.warn("[CONVERSATION CACHE] No message with content found, falling back to last non-tool message")
+        end
+        
+        last_idx
       end
       
       def apply_cache_control_to_last_block(content_array)
@@ -478,9 +494,6 @@ module LlmToolkit
             
             friendly_message = translate_api_error_to_friendly_message(error_message, error_code)
             
-            # Mark that we've handled this error via streaming to avoid re-raising
-            streaming_state[:error_handled_via_stream] = true
-            
             yield({ 
               chunk_type: 'error', 
               error_message: friendly_message,
@@ -497,35 +510,13 @@ module LlmToolkit
         end
       end
       
-      # Translate API error messages to user-friendly French messages
-      # @param error_message [String] The raw error message from the API
-      # @param error_code [Integer, String, nil] The HTTP status code or error code
-      # @return [String] A user-friendly error message in French
       def translate_api_error_to_friendly_message(error_message, error_code = nil)
-        # First check by error code for common HTTP status codes
-        case error_code.to_i
-        when 402
-          # Payment required - insufficient credits
-          return "Crédits insuffisants pour cette requête. Veuillez recharger votre compte OpenRouter pour continuer."
-        when 429
-          return "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
-        when 401, 403
-          return "Erreur d'authentification avec le service. Veuillez contacter l'administrateur."
-        when 413
-          return "La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
-        when 503, 502, 504
-          return "Le service est temporairement indisponible. Veuillez réessayer dans quelques instants."
-        end
-        
-        # Then check by message content
         case error_message
-        when /requires more credits/i, /can only afford/i, /add more credits/i, /insufficient.*credits/i
-          "Crédits insuffisants pour cette requête. Veuillez recharger votre compte OpenRouter pour continuer."
         when /no endpoints found that support tool use/i
           "Le modèle sélectionné ne prend pas en charge les outils avancés."
         when /rate limit/i, /too many requests/i
           "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
-        when /model .* not found/i, /model.*does not exist/i
+        when /model .* not found/i
           "Le modèle demandé n'est pas disponible. Essayez de sélectionner un autre modèle."
         when /tool_use.*without.*tool_result/i, /tool_result.*tool_use_id/i
           "Erreur de synchronisation des outils. Veuillez réessayer ou démarrer une nouvelle conversation."
@@ -535,22 +526,15 @@ module LlmToolkit
           else
             "Requête invalide: #{error_message.truncate(150)}"
           end
-        when /context.*too long/i, /maximum context length/i, /max.*tokens.*exceeded/i
+        when /context.*too long/i, /maximum context length/i
           "La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
-        when /content.*filter/i, /safety/i, /blocked/i
+        when /content.*filter/i, /safety/i
           "Le contenu a été filtré pour des raisons de sécurité."
         when /timeout/i
           "La requête a pris trop de temps. Veuillez réessayer."
-        when /authentication/i, /unauthorized/i, /api.?key/i, /invalid.*key/i
+        when /authentication/i, /unauthorized/i, /api.?key/i
           "Erreur d'authentification avec le service. Veuillez contacter l'administrateur."
-        when /quota/i, /limit.*exceeded/i
-          "Quota dépassé. Veuillez contacter l'administrateur ou réessayer plus tard."
-        when /server.*error/i, /internal.*error/i
-          "Erreur interne du service. Veuillez réessayer dans quelques instants."
-        when /overloaded/i, /capacity/i
-          "Le service est surchargé. Veuillez réessayer dans quelques instants."
         else
-          # For unknown errors, provide a truncated version of the original message
           "Erreur API: #{error_message.truncate(200)}"
         end
       end
