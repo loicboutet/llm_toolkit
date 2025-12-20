@@ -4,7 +4,7 @@ module LlmToolkit
     include OpenrouterHandler
     include AnthropicHandler
     
-    belongs_to :owner, polymorphic: true
+    belongs_to :owner, polymorphic: true, optional: true
     has_many :llm_models, dependent: :destroy, class_name: 'LlmToolkit::LlmModel', foreign_key: 'llm_provider_id'
 
     validates :name, presence: true, uniqueness: { scope: [:owner_id, :owner_type] }
