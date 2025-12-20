@@ -5,6 +5,81 @@ module LlmToolkit
       
       private
       
+      # Non-streaming call to Anthropic API with caching support
+      def call_anthropic(llm_model, system_messages, conversation_history, tools = nil)
+        client = Faraday.new(url: 'https://api.anthropic.com') do |f|
+          f.request :json
+          f.response :json
+          f.adapter Faraday.default_adapter
+          f.options.timeout = 300
+          f.options.open_timeout = 10
+        end
+
+        tools = Array(tools)
+        all_tools = tools.presence || LlmToolkit::ToolService.tool_definitions
+        
+        Rails.logger.info("Anthropic - Tools count: #{all_tools.size}")
+
+        model_name = llm_model.model_id.presence || llm_model.name
+        max_tokens = settings&.dig('max_tokens').to_i || LlmToolkit.config.default_max_tokens
+        Rails.logger.info("Anthropic - Using model: #{model_name}")
+        Rails.logger.info("Anthropic - Max tokens: #{max_tokens}")
+
+        # Format system messages for Anthropic with caching support
+        system_content = format_system_messages_for_anthropic_with_caching(system_messages)
+        
+        # Format conversation history with caching support
+        formatted_messages = format_conversation_for_anthropic(conversation_history)
+
+        request_body = {
+          model: model_name,
+          system: system_content,
+          messages: formatted_messages,
+          tools: all_tools,
+          max_tokens: max_tokens
+        }
+        request_body[:tool_choice] = { type: "auto" } if tools.present?
+        
+        Rails.logger.info("Anthropic - System content blocks: #{system_content.is_a?(Array) ? system_content.size : 1}")
+        Rails.logger.info("Anthropic - Conversation history: #{formatted_messages.size} messages")
+        
+        log_anthropic_caching_info(system_content, formatted_messages)
+        
+        if Rails.env.development?
+          Rails.logger.debug "ANTHROPIC REQUEST BODY: #{JSON.pretty_generate(request_body)}"
+        end
+
+        response = client.post('/v1/messages') do |req|
+          req.headers['Content-Type'] = 'application/json'
+          req.headers['x-api-key'] = api_key
+          req.headers['anthropic-version'] = '2023-06-01'
+          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31'
+          req.body = request_body.to_json
+        end
+
+        if response.success?
+          Rails.logger.info("Anthropic - Received successful response")
+          
+          # Log cache usage from response
+          if response.body['usage']
+            usage = response.body['usage']
+            cache_creation = usage['cache_creation_input_tokens'].to_i
+            cache_read = usage['cache_read_input_tokens'].to_i
+            if cache_creation > 0 || cache_read > 0
+              Rails.logger.info("[ANTHROPIC CACHE] creation=#{cache_creation}, read=#{cache_read}")
+            end
+          end
+          
+          standardize_response(response.body)
+        else
+          Rails.logger.error("Anthropic API error: #{response.body}")
+          raise ApiError, "API error: #{response.body['error']['message']}"
+        end
+      rescue Faraday::Error => e
+        Rails.logger.error("Anthropic API error: #{e.message}")
+        raise ApiError, "Network error: #{e.message}"
+      end
+      
       # Stream chat implementation for Anthropic direct API
       # Uses Server-Sent Events (SSE) for real-time streaming
       # @param llm_model [LlmModel] The model to use
@@ -31,21 +106,26 @@ module LlmToolkit
         Rails.logger.info("Anthropic Streaming - Max tokens: #{max_tokens}")
         Rails.logger.info("Anthropic Streaming - Tools count: #{all_tools.size}")
 
-        # Format system messages for Anthropic (simple text format)
-        system_content = format_system_messages_for_anthropic(system_messages)
+        # Format system messages for Anthropic with caching support
+        system_content = format_system_messages_for_anthropic_with_caching(system_messages)
+        
+        # Format conversation history with caching support
+        formatted_messages = format_conversation_for_anthropic(conversation_history)
 
         request_body = {
           model: model_name,
           system: system_content,
-          messages: conversation_history,
+          messages: formatted_messages,
           tools: all_tools,
           max_tokens: max_tokens,
           stream: true
         }
         request_body[:tool_choice] = { type: "auto" } if tools.present?
 
-        Rails.logger.info("Anthropic Streaming - System content length: #{system_content.length}")
-        Rails.logger.info("Anthropic Streaming - Conversation history: #{conversation_history.size} messages")
+        Rails.logger.info("Anthropic Streaming - System content blocks: #{system_content.is_a?(Array) ? system_content.size : 1}")
+        Rails.logger.info("Anthropic Streaming - Conversation history: #{formatted_messages.size} messages")
+        
+        log_anthropic_caching_info(system_content, formatted_messages)
 
         # Initialize streaming state
         streaming_state = {
@@ -101,7 +181,198 @@ module LlmToolkit
         raise ApiError, "Network error during Anthropic streaming: #{e.message}"
       end
       
-      private
+      # =========================================================================
+      # Message Formatting with Caching Support
+      # =========================================================================
+      
+      # Format system messages for Anthropic API with caching support
+      # Anthropic's system parameter can be either a string or an array of content blocks
+      # For caching, we need to use the array format with cache_control
+      def format_system_messages_for_anthropic_with_caching(system_messages)
+        return [{ type: 'text', text: 'You are an AI assistant.' }] if system_messages.blank?
+        
+        content_blocks = []
+        
+        if complex_system_messages?(system_messages)
+          # Extract content blocks from complex format
+          system_messages.each do |msg|
+            next unless msg[:content].is_a?(Array)
+            msg[:content].each do |content_item|
+              content_blocks << content_item.dup
+            end
+          end
+        else
+          # Simple format - combine into single text block
+          text_content = system_messages.map { |msg| 
+            msg.is_a?(Hash) ? msg[:text] : msg.to_s 
+          }.join("\n")
+          
+          content_blocks << { type: 'text', text: text_content }
+        end
+        
+        # Apply cache_control to the last text block if caching is enabled
+        if caching_enabled? && content_blocks.any?
+          last_text_idx = content_blocks.rindex { |block| block[:type] == 'text' }
+          if last_text_idx
+            content_blocks[last_text_idx] = content_blocks[last_text_idx].dup
+            content_blocks[last_text_idx][:cache_control] = { type: 'ephemeral' }
+            
+            total_chars = content_blocks.sum { |b| b[:text]&.length.to_i }
+            Rails.logger.info("[ANTHROPIC SYSTEM CACHE] Applied cache_control to system (#{total_chars} chars)")
+          end
+        end
+        
+        content_blocks
+      end
+      
+      # Format conversation history for Anthropic API with caching support
+      # Apply cache_control to the last 2 non-tool messages for incremental caching
+      def format_conversation_for_anthropic(conversation_history)
+        messages = Array(conversation_history)
+        return [] if messages.empty?
+        
+        # Find indices of the last 2 non-tool messages for cache breakpoints
+        cache_breakpoint_indices = find_anthropic_cache_breakpoint_indices(messages)
+        
+        Rails.logger.info("[ANTHROPIC CONVERSATION CACHE] Will apply cache_control to message indices: #{cache_breakpoint_indices.inspect}")
+        
+        messages.each_with_index.map do |msg, index|
+          fixed_msg = msg.dup
+          should_cache = cache_breakpoint_indices.include?(index) && caching_enabled?
+          
+          content = msg[:content]
+          
+          # Handle different content formats
+          if content.nil?
+            fixed_msg[:content] = []
+          elsif content.is_a?(String)
+            if should_cache
+              fixed_msg[:content] = [
+                { type: 'text', text: content, cache_control: { type: 'ephemeral' } }
+              ]
+              Rails.logger.info("[ANTHROPIC CACHE] Breakpoint at message #{index} (#{msg[:role]}, #{content.length} chars)")
+            else
+              # Anthropic accepts string content for user/assistant messages
+              fixed_msg[:content] = content
+            end
+          elsif content.is_a?(Array)
+            if should_cache
+              fixed_msg[:content] = apply_anthropic_cache_control_to_last_block(content)
+              text_chars = content.sum { |item| (item[:text] || item['text'])&.length.to_i }
+              Rails.logger.info("[ANTHROPIC CACHE] Breakpoint at message #{index} (#{msg[:role]}, #{text_chars} chars in array)")
+            else
+              fixed_msg[:content] = content
+            end
+          end
+          
+          # Preserve tool_calls if present
+          if msg[:tool_calls].present?
+            fixed_msg[:tool_calls] = msg[:tool_calls]
+          end
+          
+          fixed_msg
+        end
+      end
+      
+      # Find indices for cache breakpoints (last 2 non-tool_result messages)
+      def find_anthropic_cache_breakpoint_indices(messages)
+        return [] if messages.empty?
+        
+        # Find indices of cacheable messages (user and assistant, not tool_result)
+        cacheable_indices = []
+        messages.each_with_index do |msg, idx|
+          # Skip tool_result messages (they have tool_use_id)
+          next if msg[:tool_use_id].present? || msg['tool_use_id'].present?
+          cacheable_indices << idx
+        end
+        
+        # Return the last 2 cacheable message indices
+        cacheable_indices.last(2)
+      end
+      
+      # Apply cache_control to the last content block in an array
+      def apply_anthropic_cache_control_to_last_block(content_array)
+        return content_array if content_array.blank?
+        
+        # Find the last text block
+        last_text_index = nil
+        content_array.each_with_index do |item, idx|
+          item_type = item[:type] || item['type']
+          if item_type == 'text'
+            last_text_index = idx
+          end
+        end
+        
+        last_text_index ||= content_array.size - 1
+        
+        content_array.each_with_index.map do |item, idx|
+          if idx == last_text_index
+            item_dup = item.dup
+            item_dup[:cache_control] = { type: 'ephemeral' }
+            item_dup
+          else
+            item
+          end
+        end
+      end
+      
+      # =========================================================================
+      # Logging Helpers
+      # =========================================================================
+      
+      # Log caching info for debugging
+      def log_anthropic_caching_info(system_content, messages)
+        # Log system cache info
+        if system_content.is_a?(Array)
+          has_system_cache = system_content.any? { |b| b[:cache_control].present? }
+          if has_system_cache
+            total_chars = system_content.sum { |b| b[:text]&.length.to_i }
+            Rails.logger.info("[ANTHROPIC SYSTEM] Cache enabled, #{total_chars} chars")
+          end
+        end
+        
+        # Log conversation cache info
+        cached_count = 0
+        cached_positions = []
+        messages.each_with_index do |msg, idx|
+          next unless msg[:content].is_a?(Array)
+          msg[:content].each do |item|
+            if item[:cache_control].present?
+              cached_count += 1
+              cached_positions << "msg[#{idx}] (#{msg[:role]})"
+            end
+          end
+        end
+        
+        if cached_count > 0
+          Rails.logger.info("[ANTHROPIC CONVERSATION] #{cached_count} cache breakpoint(s) at: #{cached_positions.join(', ')}")
+        end
+      end
+      
+      def log_anthropic_final_usage(streaming_state)
+        usage = streaming_state[:usage_info]
+        return unless usage
+        
+        Rails.logger.info("ANTHROPIC STREAMING COMPLETE - Final usage: #{usage.inspect}")
+        
+        prompt_tokens = usage['prompt_tokens'].to_i
+        completion_tokens = usage['completion_tokens'].to_i
+        cache_creation = usage['cache_creation_input_tokens'].to_i
+        cache_read = usage['cache_read_input_tokens'].to_i
+        
+        Rails.logger.info("[ANTHROPIC USAGE] prompt=#{prompt_tokens}, completion=#{completion_tokens}, total=#{prompt_tokens + completion_tokens}")
+        
+        if cache_creation > 0 || cache_read > 0
+          hit_rate = prompt_tokens > 0 ? ((cache_read.to_f / prompt_tokens) * 100).round(1) : 0
+          Rails.logger.info("[ANTHROPIC CACHE] creation=#{cache_creation}, read=#{cache_read}, hit_rate=#{hit_rate}%")
+        else
+          Rails.logger.info("[ANTHROPIC CACHE] No cache data in response - check if cache_control is being applied correctly")
+        end
+      end
+      
+      # =========================================================================
+      # Streaming Handlers
+      # =========================================================================
       
       def handle_anthropic_streaming_chunk(chunk, streaming_state, &block)
         chunk.force_encoding('UTF-8')
@@ -277,25 +548,6 @@ module LlmToolkit
           "Le service est temporairement surchargé. Veuillez réessayer."
         else
           "Erreur API: #{error_message.truncate(200)}"
-        end
-      end
-      
-      def log_anthropic_final_usage(streaming_state)
-        usage = streaming_state[:usage_info]
-        return unless usage
-        
-        Rails.logger.info("ANTHROPIC STREAMING COMPLETE - Final usage: #{usage.inspect}")
-        
-        prompt_tokens = usage['prompt_tokens'].to_i
-        completion_tokens = usage['completion_tokens'].to_i
-        cache_creation = usage['cache_creation_input_tokens'].to_i
-        cache_read = usage['cache_read_input_tokens'].to_i
-        
-        Rails.logger.info("[ANTHROPIC USAGE] prompt=#{prompt_tokens}, completion=#{completion_tokens}, total=#{prompt_tokens + completion_tokens}")
-        
-        if cache_creation > 0 || cache_read > 0
-          hit_rate = prompt_tokens > 0 ? ((cache_read.to_f / prompt_tokens) * 100).round(1) : 0
-          Rails.logger.info("[ANTHROPIC CACHE] creation=#{cache_creation}, read=#{cache_read}, hit_rate=#{hit_rate}%")
         end
       end
     end
