@@ -117,7 +117,8 @@ module LlmToolkit
           finish_reason: nil,
           json_buffer: "",
           generation_id: nil,
-          api_error: nil
+          api_error: nil,
+          error_handled_via_stream: false
         }
 
         response = client.post('chat/completions') do |req|
@@ -132,10 +133,30 @@ module LlmToolkit
         
         process_remaining_buffer(streaming_state, &block)
         
+        # Only raise an exception if we haven't already handled the error via streaming
+        # When error_handled_via_stream is true, the error message was already sent to the UI
+        # and re-raising would cause duplicate error handling
         unless (200..299).cover?(response.status)
-          error_detail = streaming_state[:api_error] || "Status #{response.status}"
-          Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
-          raise ApiError, "API streaming error: #{error_detail}"
+          if streaming_state[:error_handled_via_stream]
+            Rails.logger.info("OpenRouter API error already handled via streaming, not re-raising")
+            # Return a minimal response indicating error was handled
+            return {
+              'content' => '',
+              'model' => streaming_state[:model_name],
+              'role' => 'assistant',
+              'stop_reason' => 'error',
+              'stop_sequence' => nil,
+              'tool_calls' => [],
+              'usage' => streaming_state[:usage_info],
+              'finish_reason' => 'error',
+              'generation_id' => streaming_state[:generation_id],
+              'error_handled' => true
+            }
+          else
+            error_detail = streaming_state[:api_error] || "Status #{response.status}"
+            Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
+            raise ApiError, "API streaming error: #{error_detail}"
+          end
         end
         
         formatted_tool_calls = format_tools_response_from_openrouter(streaming_state[:tool_calls]) if streaming_state[:tool_calls].any?
@@ -457,6 +478,9 @@ module LlmToolkit
             
             friendly_message = translate_api_error_to_friendly_message(error_message, error_code)
             
+            # Mark that we've handled this error via streaming to avoid re-raising
+            streaming_state[:error_handled_via_stream] = true
+            
             yield({ 
               chunk_type: 'error', 
               error_message: friendly_message,
@@ -473,13 +497,35 @@ module LlmToolkit
         end
       end
       
+      # Translate API error messages to user-friendly French messages
+      # @param error_message [String] The raw error message from the API
+      # @param error_code [Integer, String, nil] The HTTP status code or error code
+      # @return [String] A user-friendly error message in French
       def translate_api_error_to_friendly_message(error_message, error_code = nil)
+        # First check by error code for common HTTP status codes
+        case error_code.to_i
+        when 402
+          # Payment required - insufficient credits
+          return "Crédits insuffisants pour cette requête. Veuillez recharger votre compte OpenRouter pour continuer."
+        when 429
+          return "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
+        when 401, 403
+          return "Erreur d'authentification avec le service. Veuillez contacter l'administrateur."
+        when 413
+          return "La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
+        when 503, 502, 504
+          return "Le service est temporairement indisponible. Veuillez réessayer dans quelques instants."
+        end
+        
+        # Then check by message content
         case error_message
+        when /requires more credits/i, /can only afford/i, /add more credits/i, /insufficient.*credits/i
+          "Crédits insuffisants pour cette requête. Veuillez recharger votre compte OpenRouter pour continuer."
         when /no endpoints found that support tool use/i
           "Le modèle sélectionné ne prend pas en charge les outils avancés."
         when /rate limit/i, /too many requests/i
           "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
-        when /model .* not found/i
+        when /model .* not found/i, /model.*does not exist/i
           "Le modèle demandé n'est pas disponible. Essayez de sélectionner un autre modèle."
         when /tool_use.*without.*tool_result/i, /tool_result.*tool_use_id/i
           "Erreur de synchronisation des outils. Veuillez réessayer ou démarrer une nouvelle conversation."
@@ -489,15 +535,22 @@ module LlmToolkit
           else
             "Requête invalide: #{error_message.truncate(150)}"
           end
-        when /context.*too long/i, /maximum context length/i
+        when /context.*too long/i, /maximum context length/i, /max.*tokens.*exceeded/i
           "La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
-        when /content.*filter/i, /safety/i
+        when /content.*filter/i, /safety/i, /blocked/i
           "Le contenu a été filtré pour des raisons de sécurité."
         when /timeout/i
           "La requête a pris trop de temps. Veuillez réessayer."
-        when /authentication/i, /unauthorized/i, /api.?key/i
+        when /authentication/i, /unauthorized/i, /api.?key/i, /invalid.*key/i
           "Erreur d'authentification avec le service. Veuillez contacter l'administrateur."
+        when /quota/i, /limit.*exceeded/i
+          "Quota dépassé. Veuillez contacter l'administrateur ou réessayer plus tard."
+        when /server.*error/i, /internal.*error/i
+          "Erreur interne du service. Veuillez réessayer dans quelques instants."
+        when /overloaded/i, /capacity/i
+          "Le service est surchargé. Veuillez réessayer dans quelques instants."
         else
+          # For unknown errors, provide a truncated version of the original message
           "Erreur API: #{error_message.truncate(200)}"
         end
       end

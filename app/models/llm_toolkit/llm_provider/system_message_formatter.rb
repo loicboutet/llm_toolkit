@@ -5,40 +5,39 @@ module LlmToolkit
       
       private
       
-      # Format system messages for OpenRouter, handling both simple and complex formats
+      # Format system messages for OpenRouter
       #
-      # CACHING STRATEGY for Anthropic via OpenRouter:
-      # - cache_control marks the END of a cacheable prefix
-      # - Anthropic caches "everything up to this breakpoint"
-      # - System messages are STATIC (don't change between requests)
-      # - So we apply cache_control to the LAST content block of system messages
-      # - This caches the entire system prompt for subsequent requests
+      # IMPORTANT: We do NOT add cache_control here!
+      # 
+      # Why? Because Anthropic caches the prefix UP TO the cache_control marker.
+      # If we put cache_control on both system AND conversation messages,
+      # only the content up to the FIRST marker gets cached on a hit.
       #
-      # Key insight: The cache key is based on ALL content BEFORE the cache_control marker.
-      # If that content matches a previous request, you get a cache HIT (0.1x price).
-      # If it doesn't match, you get a cache WRITE (1.25x price).
+      # Instead, we let the conversation handler put cache_control on the 
+      # LAST message, which caches EVERYTHING (system + entire conversation).
+      #
+      # Example:
+      #   [System] [User1] [Asst1] [User2<cache_control>]
+      #   └────────────────────────────────────────────┘
+      #            Entire prefix gets cached!
+      #
       def format_system_messages_for_openrouter(system_messages)
         return [] if system_messages.blank?
         
         # Check if we have complex OpenRouter format (array of message objects)
         if complex_system_messages?(system_messages)
-          Rails.logger.info "Using complex system message format for OpenRouter"
-          return apply_cache_control_to_system_messages(system_messages)
+          Rails.logger.info "Using complex system message format for OpenRouter (no cache_control here)"
+          return system_messages  # Return as-is, no cache_control added
         end
         
         # Convert simple format to OpenRouter format
-        Rails.logger.info "Converting simple system messages to OpenRouter format"
+        Rails.logger.info "Converting simple system messages to OpenRouter format (no cache_control here)"
         system_message_content = system_messages.map { |msg| 
           extract_text_from_message(msg)
         }.compact.join("\n")
         
+        # NO cache_control here - it will be added to the last conversation message
         content_item = { type: 'text', text: system_message_content }
-        
-        # Apply cache control - system messages are static, so cache them
-        if caching_enabled?
-          content_item[:cache_control] = { type: 'ephemeral' }
-          Rails.logger.info "[SYSTEM CACHE] Applied cache_control to system message (#{system_message_content.length} chars)"
-        end
         
         [{
           role: 'system',
@@ -67,56 +66,6 @@ module LlmToolkit
           }.compact.join("\n")
         else
           text.to_s
-        end
-      end
-      
-      # Apply cache_control to system messages
-      # 
-      # Strategy: Apply to the LAST text block of the LAST system message.
-      # This caches the entire system prompt since it comes first in the request.
-      #
-      # Why the last block? Because Anthropic's cache_control means:
-      # "Cache everything in the request UP TO AND INCLUDING this block"
-      #
-      # Note: Anthropic has a limit of 4 cache_control blocks total.
-      # We use 1 for system messages, leaving 3 for conversation history.
-      def apply_cache_control_to_system_messages(messages)
-        return messages unless caching_enabled?
-        
-        # Find the last text block across all system messages
-        last_msg_index = nil
-        last_content_index = nil
-        total_system_chars = 0
-        
-        messages.each_with_index do |msg, msg_idx|
-          next unless msg[:content].is_a?(Array) && msg[:content].any?
-          
-          msg[:content].each_with_index do |content_item, content_idx|
-            if content_item[:type] == 'text'
-              last_msg_index = msg_idx
-              last_content_index = content_idx
-              total_system_chars += content_item[:text]&.length.to_i
-            end
-          end
-        end
-        
-        # No text content found
-        return messages if last_msg_index.nil?
-        
-        # Apply cache_control to the last text block (end of system prompt)
-        messages.each_with_index.map do |msg, msg_idx|
-          next msg unless msg[:content].is_a?(Array)
-          
-          updated_content = msg[:content].each_with_index.map do |content_item, content_idx|
-            if msg_idx == last_msg_index && content_idx == last_content_index
-              content_item = content_item.dup
-              content_item[:cache_control] = { type: 'ephemeral' }
-              Rails.logger.info "[SYSTEM CACHE] Applied cache_control to end of system messages (#{total_system_chars} total chars cached)"
-            end
-            content_item
-          end
-          
-          msg.merge(content: updated_content)
         end
       end
       
