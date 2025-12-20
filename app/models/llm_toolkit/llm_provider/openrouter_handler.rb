@@ -63,6 +63,7 @@ module LlmToolkit
         if response.success?
           Rails.logger.info("LlmProvider - Received successful response from OpenRouter API:")
           Rails.logger.info(response.body)
+          log_cache_stats_from_response(response.body)
           standardize_openrouter_response(response.body)
         else
           Rails.logger.error("OpenRouter API error: #{response.body}")
@@ -178,6 +179,26 @@ module LlmToolkit
         end
       end
       
+      # Log cache stats for non-streaming responses
+      def log_cache_stats_from_response(response_body)
+        usage = response_body['usage']
+        return unless usage
+        
+        cache_info = extract_cache_info_from_usage(usage)
+        prompt_tokens = usage['prompt_tokens'].to_i
+        
+        if cache_info[:has_cache_data]
+          hit_rate = prompt_tokens > 0 ? ((cache_info[:read].to_f / prompt_tokens) * 100).round(1) : 0
+          Rails.logger.info("[OPENROUTER CACHE] Response cache stats:")
+          Rails.logger.info("  - Prompt tokens: #{prompt_tokens}")
+          Rails.logger.info("  - Cache creation tokens: #{cache_info[:creation]}")
+          Rails.logger.info("  - Cache read tokens: #{cache_info[:read]}")
+          Rails.logger.info("  - Cache hit rate: #{hit_rate}%")
+        else
+          Rails.logger.info("[OPENROUTER CACHE] No cache data in response (prompt_tokens: #{prompt_tokens})")
+        end
+      end
+      
       def log_final_usage_stats(streaming_state)
         usage = streaming_state[:usage_info]
         
@@ -231,7 +252,6 @@ module LlmToolkit
           Rails.logger.info("[CONVERSATION CACHE] Tool messages in history: #{tool_message_count} (cannot have cache_control directly)")
         end
         
-        # Warn about potential cache issues with many messages
         if conversation_history.size > 20
           Rails.logger.warn("[CONVERSATION CACHE] ⚠️ Conversation has #{conversation_history.size} blocks - " \
                             "changes beyond 20 blocks from breakpoint may cause cache misses!")
@@ -240,17 +260,18 @@ module LlmToolkit
       
       # Fix conversation history for OpenRouter API compatibility
       #
-      # ANTHROPIC CACHING STRATEGY FOR MULTI-TURN CONVERSATIONS:
+      # ANTHROPIC CACHING STRATEGY FOR TOOL-HEAVY CONVERSATIONS:
       # 
-      # Key insight: Tool messages (role: "tool") CANNOT have array content with cache_control
-      # in OpenRouter format. They must have string content.
+      # Key insight: Tool messages (role: "tool") CANNOT have cache_control in OpenRouter format.
+      # They must have string content, while cache_control requires array content.
       #
-      # Strategy: Place cache breakpoints on:
-      # 1. The last NON-tool message before any tool sequence (to cache content up to tools)
-      # 2. The last user/assistant message in the conversation (for incremental caching)
+      # CRITICAL: To maximize cache hits in tool-heavy conversations, we must cache the
+      # EARLIEST stable content (first user message), not just content near the end.
       #
-      # This ensures that the entire conversation prefix including tool results gets cached,
-      # even though we can't put cache_control directly on tool messages.
+      # Strategy:
+      # 1. ALWAYS cache the first user message (creates stable prefix with system prompt)
+      # 2. Cache the last "pure" assistant message (without tool_calls) if any
+      # 3. Cache the last non-tool message for incremental caching
       #
       # Anthropic allows up to 4 cache breakpoints total:
       # 1. End of system prompt (handled in system_message_formatter.rb)
@@ -307,72 +328,70 @@ module LlmToolkit
       
       # Find the indices of messages that should have cache_control
       #
-      # IMPROVED STRATEGY for tool-heavy conversations:
+      # IMPROVED STRATEGY for tool-heavy conversations (v2):
       # 
-      # Since tool messages can't have cache_control, we need to be strategic:
-      # 1. Find the LAST non-tool message (usually user message) - this caches everything
-      # 2. Find a message BEFORE the last tool sequence to create a stable cache point
-      # 3. For very long conversations (>20 blocks), add an earlier breakpoint
+      # The key insight is that cache_control marks the END of a cacheable prefix.
+      # When we cache the first user message, Anthropic caches:
+      #   [system prompt] + [first user message]
+      # 
+      # This prefix NEVER changes during the conversation, so every subsequent
+      # request gets a cache hit on this prefix!
       #
-      # This ensures that when a new user message is added:
-      # - The prefix up to the previous cache point can still be a cache HIT
-      # - Even if tool results changed, earlier content is still cached
+      # Strategy:
+      # 1. ALWAYS cache the first user message (stable prefix, ~100% hit rate)
+      # 2. Cache the last assistant message WITHOUT tool_calls (accumulated content)
+      # 3. Cache the last non-tool message (incremental caching)
       def find_cache_breakpoint_indices(messages)
         return [] if messages.empty?
         
-        # Identify all non-tool message indices (these can have cache_control)
+        cache_indices = []
+        
+        # 1. ALWAYS cache the first user message
+        # This creates a stable cache entry for [system + first user] that never changes
+        first_user_idx = messages.index { |m| m[:role] == 'user' }
+        cache_indices << first_user_idx if first_user_idx
+        
+        # 2. Find the last assistant message WITHOUT tool_calls
+        # These are "summary" messages after tool execution, good stable points
+        pure_assistant_indices = []
+        messages.each_with_index do |msg, idx|
+          if msg[:role] == 'assistant' && msg[:tool_calls].blank? && msg[:content].present?
+            # Only consider messages with actual content
+            content = msg[:content]
+            has_content = content.is_a?(String) ? content.present? : content.any? { |c| c[:text].present? rescue false }
+            pure_assistant_indices << idx if has_content
+          end
+        end
+        
+        # Add the last "pure" assistant message if it's different from first user
+        if pure_assistant_indices.any?
+          last_pure_assistant = pure_assistant_indices.last
+          cache_indices << last_pure_assistant unless cache_indices.include?(last_pure_assistant)
+        end
+        
+        # 3. Cache the last non-tool message for incremental caching
+        # (but only if it's different from what we already have)
         non_tool_indices = []
         messages.each_with_index do |msg, idx|
           next if msg[:role] == 'tool'
           non_tool_indices << idx
         end
         
-        return [] if non_tool_indices.empty?
-        
-        # Always cache the last non-tool message (enables incremental caching)
-        cache_indices = [non_tool_indices.last]
-        
-        # Find tool sequences and add breakpoints before them
-        # A tool sequence is: assistant (with tool_calls) -> tool -> tool -> ... -> user
-        tool_sequence_starts = find_tool_sequence_start_indices(messages)
-        
-        # Add breakpoint before the LAST tool sequence if it exists and is different from last message
-        if tool_sequence_starts.any?
-          last_tool_seq_start = tool_sequence_starts.last
-          # Find the non-tool message just before this tool sequence
-          breakpoint_before_tools = non_tool_indices.select { |i| i < last_tool_seq_start }.last
-          if breakpoint_before_tools && !cache_indices.include?(breakpoint_before_tools)
-            cache_indices.unshift(breakpoint_before_tools)
-          end
-        end
-        
-        # For very long conversations, add an early breakpoint to handle 20-block lookback limit
-        # This ensures cache hits even when changes happen beyond 20 blocks
-        if messages.size > 25 && non_tool_indices.size > 4
-          # Add a breakpoint around 1/3 into the conversation
-          early_breakpoint_position = non_tool_indices.size / 3
-          early_breakpoint = non_tool_indices[early_breakpoint_position]
-          if early_breakpoint && !cache_indices.include?(early_breakpoint)
-            cache_indices.unshift(early_breakpoint)
-          end
+        if non_tool_indices.any?
+          last_non_tool = non_tool_indices.last
+          cache_indices << last_non_tool unless cache_indices.include?(last_non_tool)
         end
         
         # Anthropic allows max 4 breakpoints total (1 for system + 3 for conversation)
-        # Keep only the last 3 to stay within limits
-        cache_indices = cache_indices.last(3)
-        
-        cache_indices.sort
-      end
-      
-      # Find indices where tool sequences start (assistant message with tool_calls)
-      def find_tool_sequence_start_indices(messages)
-        starts = []
-        messages.each_with_index do |msg, idx|
-          if msg[:role] == 'assistant' && msg[:tool_calls].present?
-            starts << idx
-          end
+        # Keep only 3 to stay within limits, but prioritize the first user message
+        if cache_indices.size > 3
+          # Always keep first_user_idx, then take the last 2 others
+          first = cache_indices.first
+          others = cache_indices[1..-1].last(2)
+          cache_indices = [first] + others
         end
-        starts
+        
+        cache_indices.compact.uniq.sort
       end
       
       # Apply cache_control to the LAST content block in an array

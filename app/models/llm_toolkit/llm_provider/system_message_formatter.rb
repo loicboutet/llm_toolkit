@@ -29,8 +29,8 @@ module LlmToolkit
         # Convert simple format to OpenRouter format
         Rails.logger.info "Converting simple system messages to OpenRouter format"
         system_message_content = system_messages.map { |msg| 
-          msg.is_a?(Hash) ? msg[:text] : msg.to_s 
-        }.join("\n")
+          extract_text_from_message(msg)
+        }.compact.join("\n")
         
         content_item = { type: 'text', text: system_message_content }
         
@@ -44,6 +44,30 @@ module LlmToolkit
           role: 'system',
           content: [content_item]
         }]
+      end
+      
+      # Extract text content from a message in various formats
+      # Supports: { content: "..." }, { text: "..." }, plain strings, etc.
+      def extract_text_from_message(msg)
+        return msg.to_s unless msg.is_a?(Hash)
+        
+        # Try various keys that might contain the text
+        text = msg[:content] || msg[:text] || msg['content'] || msg['text']
+        
+        return nil if text.nil?
+        
+        # If it's an array (complex content), extract text from it
+        if text.is_a?(Array)
+          text.map { |item|
+            if item.is_a?(Hash)
+              item[:text] || item['text']
+            else
+              item.to_s
+            end
+          }.compact.join("\n")
+        else
+          text.to_s
+        end
       end
       
       # Apply cache_control to system messages
@@ -137,10 +161,10 @@ module LlmToolkit
           end
           text_parts.join("\n")
         else
-          # Simple format
+          # Simple format - use extract_text_from_message for consistency
           system_messages.map { |msg| 
-            msg.is_a?(Hash) ? msg[:text] : msg.to_s 
-          }.join("\n")
+            extract_text_from_message(msg)
+          }.compact.join("\n")
         end
       end
     end
