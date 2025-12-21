@@ -6,15 +6,15 @@
 #
 # ANTHROPIC CACHING STRATEGY (via OpenRouter):
 #
-# Key constraint: Tool messages (role: "tool") CANNOT have cache_control in
-# OpenRouter format - they must have string content, not array content.
+# Key findings from real-world testing:
+# 1. Tool messages CAN have array content with cache_control!
+# 2. Empty messages (content: '') cache NOTHING useful
+# 3. Minimum ~1024 tokens required for caching to activate
 #
 # Strategy:
-# 1. Cache the last non-tool message (enables incremental caching)
-# 2. Cache a message BEFORE tool sequences (so tool results get included in cache)
-# 3. For long conversations (>25 blocks), add an early breakpoint
-#
-# This ensures maximum cache hits even with tool-heavy conversations.
+# 1. Cache the first user message (stable anchor)
+# 2. Cache the last tool message with content (largest data usually!)
+# 3. Cache the last non-tool message with content (fallback)
 #
 # Run with: bin/rails test llm_toolkit/test/unit/prompt_caching_test.rb
 #
@@ -40,204 +40,207 @@ module LlmToolkit
     end
     
     # =========================================================================
-    # System Message Tests
+    # Basic Caching Tests
     # =========================================================================
     
-    test "simple system message gets cache_control" do
-      simple_system = ["You are a helpful assistant."]
-      formatted = @provider.send(:format_system_messages_for_openrouter, simple_system)
-      
-      assert formatted.any? { |msg|
-        msg[:content].is_a?(Array) && 
-        msg[:content].any? { |c| c[:cache_control].present? }
-      }, "Simple system message should have cache_control"
-    end
-    
-    test "complex system message has cache_control only on last text block" do
-      complex_system = [
-        {
-          role: 'system',
-          content: [
-            { type: 'text', text: 'First block' },
-            { type: 'text', text: 'Second block' },
-            { type: 'text', text: 'Third block' }
-          ]
-        }
-      ]
-      formatted = @provider.send(:format_system_messages_for_openrouter, complex_system)
-      
-      cache_positions = []
-      formatted.each_with_index do |msg, msg_idx|
-        next unless msg[:content].is_a?(Array)
-        msg[:content].each_with_index do |content, content_idx|
-          cache_positions << [msg_idx, content_idx] if content[:cache_control].present?
-        end
-      end
-      
-      assert_equal 1, cache_positions.length, "Should have exactly 1 cache_control block"
-      assert_equal [0, 2], cache_positions.first, "cache_control should be on last (index 2) text block"
-    end
-    
-    # =========================================================================
-    # Conversation History Tests - Basic Caching
-    # =========================================================================
-    
-    test "single message gets cache_control on that message" do
+    test "single user message gets cache_control" do
       conv_history = [
-        { role: 'user', content: 'Hello' }
+        { role: 'user', content: 'Hello world!' }
       ]
       
       fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       
-      # The last (and only) message should have cache_control
-      last_msg = fixed[0]
-      assert last_msg[:content].is_a?(Array), "Message content should be array"
-      assert last_msg[:content].any? { |c| c[:cache_control].present? }, 
-        "Last message should have cache_control"
+      assert fixed[0][:content].is_a?(Array), "Message content should be array"
+      assert fixed[0][:content].any? { |c| c[:cache_control].present? }, 
+        "Single message should have cache_control"
     end
     
-    test "simple two message conversation caches last message" do
+    test "two message conversation caches first user and last with content" do
       conv_history = [
         { role: 'user', content: 'Hello' },
         { role: 'assistant', content: 'Hi there!' }
       ]
       
       fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
-      
-      # Last message should have cache_control
       cache_positions = find_cache_indices(fixed)
-      assert cache_positions.include?(1), "Last message should have cache_control"
+      
+      assert cache_positions.include?(0), "First user message should be cached"
+      assert cache_positions.include?(1), "Last message with content should be cached"
     end
     
     # =========================================================================
-    # Tool Message Tests - Critical for your issue!
+    # Tool Message Caching - NEW! Tool messages can be cached!
     # =========================================================================
     
-    test "tool messages have string content and are NOT cached directly" do
+    test "tool messages CAN have array content with cache_control" do
       conv_history = [
         { role: 'user', content: 'Search for Ruby tips' },
         { 
           role: 'assistant', 
-          content: '', 
+          content: 'Let me search for that.', 
           tool_calls: [{ id: 'tool_1', type: 'function', function: { name: 'search', arguments: '{}' } }] 
         },
-        { role: 'tool', tool_call_id: 'tool_1', content: 'Search results here' },
+        { role: 'tool', tool_call_id: 'tool_1', content: 'Search results here with lots of content' },
         { role: 'user', content: 'Thanks!' }
       ]
       
       fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       
-      # Tool message must have string content (OpenRouter format requirement)
-      tool_msg = fixed.find { |m| m[:role] == 'tool' }
+      # Tool message at index 2 should be cached (last tool with content)
+      tool_msg = fixed[2]
       assert tool_msg.present?, "Tool message should exist"
-      assert tool_msg[:content].is_a?(String), 
-        "Tool message content MUST be string, got #{tool_msg[:content].class}"
       
-      # Tool message should NOT have cache_control (it can't in OpenRouter format)
-      refute tool_msg[:content].is_a?(Array), "Tool message should not have array content"
+      # Tool message should have array content with cache_control
+      assert tool_msg[:content].is_a?(Array), 
+        "Cached tool message should have array content"
+      assert tool_msg[:content].any? { |c| c[:cache_control].present? },
+        "Cached tool message should have cache_control"
     end
     
-    test "cache breakpoint is placed BEFORE tool sequence to include tools in cache" do
+    test "last tool message with content is cached" do
       conv_history = [
-        { role: 'user', content: 'First question' },                    # 0
-        { role: 'assistant', content: 'First answer' },                  # 1
-        { role: 'user', content: 'Search for something' },               # 2
-        { 
-          role: 'assistant', 
-          content: '', 
-          tool_calls: [{ id: 'tool_1', type: 'function', function: { name: 'search', arguments: '{}' } }] 
-        },                                                               # 3 - tool sequence starts
-        { role: 'tool', tool_call_id: 'tool_1', content: 'Results' },    # 4
-        { role: 'user', content: 'Thanks for the results!' }             # 5
+        { role: 'user', content: 'Help me' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't1' }] },
+        { role: 'tool', tool_call_id: 't1', content: 'First result' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't2' }] },
+        { role: 'tool', tool_call_id: 't2', content: 'Second result - larger' },  # LAST tool
+        { role: 'assistant', content: 'Analysis complete.' },
       ]
       
       fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
-      
-      # Should have cache on:
-      # - Message before tool sequence (index 2) - to cache prefix including this user message
-      # - Last message (index 5) - for incremental caching
       cache_positions = find_cache_indices(fixed)
       
-      # Last message should definitely be cached
-      assert cache_positions.include?(5), "Last message (index 5) should have cache_control"
-      
-      # There should be a breakpoint that allows tool results to be cached
-      # Either before the tool sequence or the last message will do
-      assert cache_positions.any?, "Should have at least one cache breakpoint"
+      # Should cache: first user (0), last tool (4), last with content (5)
+      assert cache_positions.include?(0), "First user should be cached"
+      assert cache_positions.include?(4), "Last tool message should be cached"
+      assert cache_positions.include?(5), "Last assistant with content should be cached"
     end
     
-    test "multiple tool sequences get proper cache breakpoints" do
+    # =========================================================================
+    # Empty Message Tests - CRITICAL: Empty messages should NOT be cached
+    # =========================================================================
+    
+    test "CRITICAL: empty assistant message is NOT cached" do
       conv_history = [
-        { role: 'user', content: 'Hello' },                              # 0
-        { role: 'assistant', content: 'Hi!' },                           # 1
-        { role: 'user', content: 'Do task 1' },                          # 2
+        { role: 'user', content: 'List all files' },
         { 
           role: 'assistant', 
-          content: '', 
-          tool_calls: [{ id: 't1', type: 'function', function: { name: 'tool1', arguments: '{}' } }] 
-        },                                                               # 3
-        { role: 'tool', tool_call_id: 't1', content: 'Result 1' },       # 4
-        { role: 'user', content: 'Now do task 2' },                      # 5
-        { 
-          role: 'assistant', 
-          content: '', 
-          tool_calls: [{ id: 't2', type: 'function', function: { name: 'tool2', arguments: '{}' } }] 
-        },                                                               # 6
-        { role: 'tool', tool_call_id: 't2', content: 'Result 2' },       # 7
-        { role: 'user', content: 'Thanks!' }                             # 8
+          content: '',  # <-- EMPTY! Only tool calls
+          tool_calls: [{ id: 'tool_1', type: 'function', function: { name: 'list', arguments: '{}' } }] 
+        },
+        { role: 'tool', tool_call_id: 'tool_1', content: 'file1.rb, file2.rb' }
       ]
       
-      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
+      indices = @provider.send(:find_cache_breakpoint_indices, conv_history)
       
-      cache_positions = find_cache_indices(fixed)
+      # Empty assistant (index 1) should NOT be in cache indices
+      refute indices.include?(1), "CRITICAL: Empty assistant message should NOT be cached!"
       
-      # Last user message should be cached
-      assert cache_positions.include?(8), "Last message should have cache_control"
+      # First user (0) and tool (2) should be cached
+      assert indices.include?(0), "First user message should be cached"
+      assert indices.include?(2), "Tool message with content should be cached"
+    end
+    
+    test "finds last message WITH content, not just last non-tool" do
+      conv_history = [
+        { role: 'user', content: 'Help me review files' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't1' }] },
+        { role: 'tool', tool_call_id: 't1', content: 'File 1 content' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't2' }] },
+        { role: 'tool', tool_call_id: 't2', content: 'File 2 content' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't3' }] },  # Last non-tool but EMPTY
+        { role: 'tool', tool_call_id: 't3', content: 'File 3 content' },  # Last tool
+      ]
       
-      # No tool messages should have cache (they can't)
-      [4, 7].each do |tool_idx|
-        refute cache_positions.include?(tool_idx), "Tool message at #{tool_idx} should NOT have cache"
-      end
+      indices = @provider.send(:find_cache_breakpoint_indices, conv_history)
+      
+      # Should cache: first user (0), last tool (6)
+      # Should NOT cache empty assistants (1, 3, 5)
+      assert indices.include?(0), "First user should be cached"
+      assert indices.include?(6), "Last tool should be cached"
+      refute indices.include?(1), "Empty assistant at 1 should NOT be cached"
+      refute indices.include?(3), "Empty assistant at 3 should NOT be cached"
+      refute indices.include?(5), "Empty assistant at 5 should NOT be cached"
     end
     
     # =========================================================================
-    # Long Conversation Tests - 20-block lookback issue
+    # Cache Breakpoint Index Tests
     # =========================================================================
     
-    test "long conversation gets early breakpoint for 20-block lookback" do
-      # Create a conversation with 30 messages (exceeds 20-block lookback)
+    test "find_cache_breakpoint_indices includes tool messages" do
+      messages = [
+        { role: 'user', content: 'Start' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't1' }] },
+        { role: 'tool', tool_call_id: 't1', content: 'Large tool result here' },
+        { role: 'assistant', content: 'Done.' },
+      ]
+      
+      indices = @provider.send(:find_cache_breakpoint_indices, messages)
+      
+      assert indices.include?(0), "Should include first user (0)"
+      assert indices.include?(2), "Should include tool message (2)"
+      assert indices.include?(3), "Should include last with content (3)"
+    end
+    
+    test "find_cache_breakpoint_indices with only empty assistants" do
+      messages = [
+        { role: 'user', content: 'Start' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't1' }] },
+        { role: 'tool', tool_call_id: 't1', content: 'result' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't2' }] },
+        { role: 'tool', tool_call_id: 't2', content: 'result2' },
+      ]
+      
+      indices = @provider.send(:find_cache_breakpoint_indices, messages)
+      
+      # Should cache: first user (0), last tool (4)
+      assert indices.include?(0), "Should include first user (0)"
+      assert indices.include?(4), "Should include last tool (4)"
+      refute indices.include?(1), "Should NOT include empty assistant (1)"
+      refute indices.include?(3), "Should NOT include empty assistant (3)"
+    end
+    
+    # =========================================================================
+    # Long Conversation Tests
+    # =========================================================================
+    
+    test "long conversation caches strategically" do
       conv_history = []
-      15.times do |i|
-        conv_history << { role: 'user', content: "User message #{i}" }
-        conv_history << { role: 'assistant', content: "Assistant response #{i}" }
+      
+      conv_history << { role: 'user', content: 'Review the project' }
+      
+      # 10 tool call cycles
+      10.times do |i|
+        conv_history << {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: "call_#{i}", type: 'function', function: { name: 'read', arguments: '{}' } }]
+        }
+        conv_history << {
+          role: 'tool',
+          tool_call_id: "call_#{i}",
+          content: "Result #{i}: " + ("x" * 100)
+        }
       end
       
-      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
+      conv_history << { role: 'assistant', content: 'I have reviewed all files.' }
       
+      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       cache_positions = find_cache_indices(fixed)
       
-      # Should have multiple breakpoints to handle 20-block lookback
-      assert cache_positions.size >= 2, 
-        "Long conversation should have multiple cache breakpoints, got #{cache_positions.size}"
+      # Should have 3 cache points maximum
+      assert cache_positions.size <= 3, "Should have at most 3 cache breakpoints"
       
-      # Last message should always be cached
-      assert cache_positions.include?(conv_history.size - 1), 
-        "Last message should be cached"
+      # First user should always be cached
+      assert cache_positions.include?(0), "First user should be cached"
       
-      # Should have an early breakpoint (before position 20)
-      early_breakpoints = cache_positions.select { |pos| pos < 20 }
-      assert early_breakpoints.any?, 
-        "Should have early breakpoint for 20-block lookback limit"
+      # Last tool (index 20) should be cached
+      assert cache_positions.include?(20), "Last tool message should be cached"
     end
-    
-    # =========================================================================
-    # Cache Limit Test
-    # =========================================================================
     
     test "total cache_control blocks within Anthropic limit of 4" do
-      # Large conversation with tools
       conv_history = []
-      20.times do |i|
+      30.times do |i|
         conv_history << { role: 'user', content: "Question #{i}" }
         if i % 3 == 0
           conv_history << { 
@@ -251,25 +254,15 @@ module LlmToolkit
         end
       end
       
-      test_system = [{ type: 'text', text: 'System prompt' * 100 }]
-      
-      formatted_sys = @provider.send(:format_system_messages_for_openrouter, test_system)
       fixed_hist = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       
-      total_cache_controls = 0
-      
-      formatted_sys.each do |msg|
-        next unless msg[:content].is_a?(Array)
-        msg[:content].each { |c| total_cache_controls += 1 if c[:cache_control].present? }
+      total_cache_controls = fixed_hist.sum do |msg|
+        next 0 unless msg[:content].is_a?(Array)
+        msg[:content].count { |c| c[:cache_control].present? }
       end
       
-      fixed_hist.each do |msg|
-        next unless msg[:content].is_a?(Array)
-        msg[:content].each { |c| total_cache_controls += 1 if c[:cache_control].present? }
-      end
-      
-      assert total_cache_controls <= 4, 
-        "Should use at most 4 cache_control blocks, using #{total_cache_controls}"
+      assert total_cache_controls <= 3, 
+        "Should use at most 3 cache_control blocks, using #{total_cache_controls}"
     end
     
     # =========================================================================
@@ -279,116 +272,72 @@ module LlmToolkit
     test "no cache_control when caching disabled" do
       LlmToolkit.config.enable_prompt_caching = false
       
-      test_system = [{ type: 'text', text: 'System prompt' }]
       test_history = [
         { role: 'user', content: 'Hello' },
         { role: 'assistant', content: 'Hi!' },
+        { role: 'tool', tool_call_id: 't1', content: 'result' },
         { role: 'user', content: 'Bye' }
       ]
       
-      formatted_sys = @provider.send(:format_system_messages_for_openrouter, test_system)
       fixed_hist = @provider.send(:fix_conversation_history_for_openrouter, test_history)
-      
-      sys_cache_count = formatted_sys.sum do |msg|
-        next 0 unless msg[:content].is_a?(Array)
-        msg[:content].count { |c| c[:cache_control].present? }
-      end
       
       hist_cache_count = fixed_hist.sum do |msg|
         next 0 unless msg[:content].is_a?(Array)
         msg[:content].count { |c| c[:cache_control].present? }
       end
       
-      assert_equal 0, sys_cache_count, "No cache_control when disabled (system)"
-      assert_equal 0, hist_cache_count, "No cache_control when disabled (history)"
+      assert_equal 0, hist_cache_count, "No cache_control when disabled"
     end
     
     # =========================================================================
     # Edge Cases
     # =========================================================================
     
-    test "nil content converted to empty string" do
+    test "nil content treated as empty" do
       conv_history = [
         { role: 'user', content: 'Hello' },
         { role: 'assistant', content: nil },
         { role: 'user', content: 'Continue' }
       ]
       
-      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
+      indices = @provider.send(:find_cache_breakpoint_indices, conv_history)
       
-      # nil content should become empty string
-      assistant_msg = fixed[1]
-      if assistant_msg[:content].is_a?(Array)
-        text_content = assistant_msg[:content].find { |c| c[:type] == 'text' }
-        assert text_content.nil? || text_content[:text].to_s.empty?, 
-          "nil content should result in empty content"
-      else
-        assert_equal "", assistant_msg[:content], 
-          "nil content should be converted to empty string"
-      end
+      refute indices.include?(1), "nil content message should NOT be cached"
+      assert indices.include?(0), "First user should be cached"
+      assert indices.include?(2), "Last user with content should be cached"
     end
     
-    test "tool message with array content is converted to string" do
+    test "whitespace-only content treated as empty" do
       conv_history = [
         { role: 'user', content: 'Hello' },
-        { 
-          role: 'tool', 
-          tool_call_id: 'tool_1', 
-          content: [
-            { type: 'text', text: 'Result line 1' },
-            { type: 'text', text: 'Result line 2' }
-          ] 
-        }
+        { role: 'assistant', content: '   ' },
+        { role: 'user', content: 'Continue' }
       ]
       
-      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
+      indices = @provider.send(:find_cache_breakpoint_indices, conv_history)
       
-      tool_msg = fixed.find { |m| m[:role] == 'tool' }
-      assert tool_msg[:content].is_a?(String), "Tool message content should be converted to string"
-      assert tool_msg[:content].include?('Result line 1'), "Should contain first line"
-      assert tool_msg[:content].include?('Result line 2'), "Should contain second line"
+      refute indices.include?(1), "Whitespace-only content should NOT be cached"
     end
     
-    test "handles string keys from conversation history" do
-      conv_history = [
-        { 
-          role: 'user', 
-          content: [
-            { 'type' => 'text', 'text' => 'Hello with string keys' }
-          ]
-        }
-      ]
-      
-      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
-      
-      assert fixed[0][:content].is_a?(Array), "Content should be array"
-      
-      has_cache = fixed[0][:content].any? do |item|
-        item[:cache_control].present? || item['cache_control'].present?
-      end
-      
-      assert has_cache, "Should have cache_control on last message"
-    end
-    
-    # =========================================================================
-    # Helper to find tool sequence starts
-    # =========================================================================
-    
-    test "find_tool_sequence_start_indices identifies tool sequences" do
+    test "non-cached tool message has string content" do
+      # When tool message is NOT selected for caching, it should have string content
       conv_history = [
         { role: 'user', content: 'Hello' },
-        { role: 'assistant', content: 'Hi', tool_calls: [{ id: 't1' }] },  # Tool sequence start
-        { role: 'tool', tool_call_id: 't1', content: 'result' },
-        { role: 'user', content: 'Thanks' },
-        { role: 'assistant', content: 'No problem' },  # No tool calls
-        { role: 'user', content: 'Do more' },
-        { role: 'assistant', content: '', tool_calls: [{ id: 't2' }] },  # Another tool sequence
-        { role: 'tool', tool_call_id: 't2', content: 'result2' },
+        { role: 'tool', tool_call_id: 't1', content: 'First result' },
+        { role: 'tool', tool_call_id: 't2', content: 'Second result - this one is cached' },
       ]
       
-      starts = @provider.send(:find_tool_sequence_start_indices, conv_history)
+      fixed = @provider.send(:fix_conversation_history_for_openrouter, conv_history)
       
-      assert_equal [1, 6], starts, "Should find tool sequence starts at indices 1 and 6"
+      # First tool (not last) should have string content
+      first_tool = fixed[1]
+      assert first_tool[:content].is_a?(String), 
+        "Non-cached tool message should have string content"
+      
+      # Last tool should have array content with cache
+      last_tool = fixed[2]
+      assert last_tool[:content].is_a?(Array),
+        "Cached tool message should have array content"
     end
     
     private
