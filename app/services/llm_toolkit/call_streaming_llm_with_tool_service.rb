@@ -791,9 +791,11 @@ module LlmToolkit
         Rails.logger.debug("Tool input: #{input.inspect}")
         Rails.logger.debug("Tool ID: #{id}")
         
-        existing_tool_use = @current_message.tool_uses.find_by(name: name)
+        # FIX: Search by tool_use_id (unique per call) instead of name
+        # This prevents overwriting when the same tool is called multiple times
+        existing_tool_use = @current_message.tool_uses.find_by(tool_use_id: id)
         if existing_tool_use
-          Rails.logger.debug("Tool use with name #{name} already exists, updating")
+          Rails.logger.debug("Tool use with ID #{id} already exists, updating input")
           existing_tool_use.update(input: input)
           saved_tool_use = existing_tool_use
         else
