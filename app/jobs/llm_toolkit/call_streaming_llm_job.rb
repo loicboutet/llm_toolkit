@@ -5,7 +5,9 @@ module LlmToolkit
     # Ensure only one job per conversation runs at a time
     # Additional jobs will wait in queue until the current one finishes
     # The key is the conversation_id (first argument)
-    limits_concurrency to: 1, key: ->(conversation_id, *) { "conversation_#{conversation_id}" }
+    # IMPORTANT: duration must be long enough for long-running LLM conversations with multiple tool calls
+    # Default SolidQueue concurrency duration is only 3 minutes, which is too short
+    limits_concurrency to: 1, key: ->(conversation_id, *) { "conversation_#{conversation_id}" }, duration: 60.minutes
 
     # Process streaming LLM requests asynchronously
     #
