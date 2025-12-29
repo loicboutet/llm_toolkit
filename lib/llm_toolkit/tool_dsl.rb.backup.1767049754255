@@ -61,16 +61,7 @@ module LlmToolkit
         class_params = parameters[self.name] || {}
         class_params.each_key do |key|
           # Convert string keys to symbols for named parameters
-          # IMPORTANT: Use key? to check existence, not ||, because false values would be skipped
-          str_key = key.to_s
-          sym_key = key.to_sym
-          
-          if args.key?(str_key)
-            params[key] = args[str_key]
-          elsif args.key?(sym_key)
-            params[key] = args[sym_key]
-          end
-          # If neither key exists, don't set params[key] - let the method's default value apply
+          params[key] = args[key.to_s] || args[key.to_sym]
         end
         
         # Call the instance method with named parameters
