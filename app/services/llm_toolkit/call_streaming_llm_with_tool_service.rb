@@ -637,6 +637,9 @@ module LlmToolkit
                 Rails.logger.error("Error merging tool call: #{e.message}")
               end
             end
+            
+            # Broadcast streaming tool updates to UI
+            broadcast_streaming_tool_updates
           else
             Rails.logger.error("Invalid tool_calls format: #{chunk[:tool_calls].inspect}")
           end
@@ -746,6 +749,9 @@ module LlmToolkit
     # Process tool calls detected during streaming
     def process_tool_calls(tool_calls)
       return false unless tool_calls.is_a?(Array) && tool_calls.any?
+      
+      # Clear the streaming tool indicators now that we're creating real tool_uses
+      clear_streaming_tool_indicators
       
       Rails.logger.info("Processing #{tool_calls.count} tool calls")
       dangerous_tool_encountered = false
@@ -888,7 +894,7 @@ module LlmToolkit
         
         tool_result = tool_use.create_tool_result!(
           message: tool_use.message,
-          content: result.to_s
+          content: ToolService.format_tool_result_content(result)
         )
         
         Rails.logger.info("Tool executed successfully: #{tool_use.name}")
@@ -915,6 +921,111 @@ module LlmToolkit
         llm_model: @llm_model,
         user_id: @user_id
       )
+    end
+    
+    # Broadcast streaming tool updates to the UI
+    # This shows users that tool arguments are being received
+    def broadcast_streaming_tool_updates
+      Rails.logger.info("[STREAMING_TOOLS] broadcast_streaming_tool_updates called")
+      
+      return unless @current_message
+      return if @accumulated_tool_calls.empty?
+      
+      Rails.logger.info("[STREAMING_TOOLS] accumulated_tool_calls: #{@accumulated_tool_calls.keys.inspect}")
+      
+      # Throttle streaming tool broadcasts (100ms minimum between broadcasts)
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000
+      @last_tool_broadcast ||= 0
+      if (now - @last_tool_broadcast) < 100
+        Rails.logger.debug("[STREAMING_TOOLS] Throttled - skipping broadcast")
+        return
+      end
+      @last_tool_broadcast = now
+      
+      # Transform accumulated tool calls into a format suitable for display
+      streaming_tools = @accumulated_tool_calls.values.map do |tc|
+        {
+          'name' => tc.dig('function', 'name'),
+          'arguments' => tc.dig('function', 'arguments') || ''
+        }
+      end.select { |t| t['name'].present? }
+      
+      Rails.logger.info("[STREAMING_TOOLS] streaming_tools: #{streaming_tools.map { |t| t['name'] }.inspect}")
+      
+      return if streaming_tools.empty?
+      
+      # Directly broadcast without saving to DB (more efficient)
+      target_id = "streaming_tools_for_message_#{@current_message.id}"
+      html_content = streaming_tools.map do |tool|
+        build_streaming_tool_indicator_html(tool)
+      end.join("\n")
+      
+      Rails.logger.info("[STREAMING_TOOLS] Broadcasting to target: #{target_id}")
+      
+      Turbo::StreamsChannel.broadcast_replace_to(
+        @conversation,
+        target: target_id,
+        html: "<div id=\"#{target_id}\">#{html_content}</div>"
+      )
+      
+      Rails.logger.info("[STREAMING_TOOLS] Broadcast sent!")
+    rescue => e
+      Rails.logger.error("[STREAMING_TOOLS] Error: #{e.message}")
+      Rails.logger.error(e.backtrace.first(3).join("\n"))
+    end
+    
+    # Build HTML for a single streaming tool indicator
+    def build_streaming_tool_indicator_html(tool)
+      tool_name = tool['name'] || 'unknown'
+      arguments_json = tool['arguments'] || '{}'
+      
+      # Try to get display metadata from the tool registry
+      tool_class = LlmToolkit::ToolRegistry.find_tool(tool_name) rescue nil
+      tool_metadata = tool_class&.display_metadata || { 
+        french_name: tool_name.gsub(/LlmToolkit::Tools::/, '').underscore.humanize, 
+        icon: 'bi bi-gear' 
+      }
+      
+      # Calculate streaming progress
+      json_length = arguments_json.to_s.length
+      progress_display = json_length > 0 ? "#{json_length} caractères reçus..." : "Démarrage..."
+      
+      <<~HTML
+        <div style="background-color: #1e1f23; border-radius: 8px; margin-bottom: 8px; overflow: hidden; border: 1px solid rgba(27, 239, 247, 0.3);">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px;">
+            <div style="display: flex; align-items: center; flex: 1; min-width: 0;">
+              <div style="margin-right: 8px; flex-shrink: 0;">
+                <i class="#{tool_metadata[:icon] || 'bi bi-gear'}" style="color: #1beff7;"></i>
+              </div>
+              <span style="font-size: 14px; font-weight: 500; color: #f5f5f7; margin-right: 8px; white-space: nowrap;">
+                #{tool_metadata[:french_name]}
+              </span>
+              <span style="font-size: 12px; color: #8d8e92;">
+                #{progress_display}
+              </span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <div style="width: 6px; height: 6px; border-radius: 50%; background-color: #1beff7; animation: pulse 1s ease-in-out infinite;"></div>
+              <span style="font-size: 11px; color: #1beff7;">Streaming...</span>
+            </div>
+          </div>
+        </div>
+      HTML
+    end
+    
+    # Clear the streaming tool indicators from the message
+    def clear_streaming_tool_indicators
+      return unless @current_message
+      
+      # Broadcast empty div to clear the streaming indicators
+      target_id = "streaming_tools_for_message_#{@current_message.id}"
+      Turbo::StreamsChannel.broadcast_replace_to(
+        @conversation,
+        target: target_id,
+        html: "<div id=\"#{target_id}\"></div>"
+      )
+    rescue => e
+      Rails.logger.error("Error clearing streaming tool indicators: #{e.message}")
     end
   end
   

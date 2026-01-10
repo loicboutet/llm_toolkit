@@ -62,10 +62,38 @@ module LlmToolkit
           standardize_openrouter_response(response.body)
         else
           Rails.logger.error("OpenRouter API error: #{response.body}")
+          
+          # Track non-streaming API errors
+          NexraiErrorTracker.capture_message(
+            "OpenRouter API error (non-streaming)",
+            level: :error,
+            context: {
+              provider: 'openrouter',
+              model: model_name,
+              status_code: response.status,
+              error_body: response.body.to_s.truncate(500),
+              messages_count: messages.size,
+              tools_count: request_body[:tools]&.size || 0
+            }
+          )
+          
           raise ApiError, "API error: #{response.body['error']&.[]('message') || response.body}"
         end
       rescue Faraday::Error => e
         Rails.logger.error("OpenRouter API error: #{e.message}")
+        
+        # Track network errors for non-streaming calls
+        NexraiErrorTracker.capture_exception(
+          e,
+          context: {
+            provider: 'openrouter',
+            model: model_name,
+            error_type: 'network_error',
+            messages_count: messages.size,
+            tools_count: request_body[:tools]&.size || 0
+          }
+        )
+        
         raise ApiError, "Network error: #{e.message}"
       end
 
@@ -135,6 +163,21 @@ module LlmToolkit
         unless (200..299).cover?(response.status)
           error_detail = streaming_state[:api_error] || "Status #{response.status}"
           Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
+          
+          # Track the error for monitoring
+          NexraiErrorTracker.capture_message(
+            "API streaming error: Status #{response.status}",
+            level: :error,
+            context: {
+              provider: 'openrouter',
+              model: model_name,
+              status_code: response.status,
+              error_detail: error_detail,
+              messages_count: messages.size,
+              tools_count: request_body[:tools]&.size || 0
+            }
+          )
+          
           raise ApiError, "API streaming error: #{error_detail}"
         end
         
@@ -155,6 +198,19 @@ module LlmToolkit
         }
       rescue Faraday::Error => e
         Rails.logger.error("OpenRouter API streaming error: #{e.message}")
+        
+        # Track network errors for monitoring
+        NexraiErrorTracker.capture_exception(
+          e,
+          context: {
+            provider: 'openrouter',
+            model: model_name,
+            error_type: 'network_error',
+            messages_count: messages.size,
+            tools_count: request_body[:tools]&.size || 0
+          }
+        )
+        
         raise ApiError, "Network error during streaming: #{e.message}"
       end
       
@@ -549,6 +605,18 @@ module LlmToolkit
             end
             
             Rails.logger.error("[OPENROUTER API ERROR] Code: #{error_code}, Message: #{error_message}")
+            
+            # Track API errors for monitoring
+            NexraiErrorTracker.capture_message(
+              "OpenRouter API error in stream",
+              level: :error,
+              context: {
+                provider: 'openrouter',
+                error_code: error_code,
+                error_message: error_message,
+                model: streaming_state[:model_name]
+              }
+            )
             
             streaming_state[:api_error] = error_message
             

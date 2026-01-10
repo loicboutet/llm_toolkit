@@ -236,7 +236,7 @@ module LlmToolkit
       # Create a tool result with the executed tool's result
       tool_result = tool_use.create_tool_result!(
         message: tool_use.message,
-        content: result.to_s
+        content: ToolService.format_tool_result_content(result)
       )
 
       true
