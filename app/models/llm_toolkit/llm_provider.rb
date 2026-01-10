@@ -251,7 +251,17 @@ module LlmToolkit
     end
 
     def fix_malformed_json(args_str)
-      # Case 1: Arguments string is missing opening brace
+      # Case 0: Fix streaming chunk accumulation bug
+      # Sometimes streaming chunks get concatenated incorrectly, resulting in patterns like:
+      # - {"{command": ... (extra { after the opening {")
+      # This happens when chunks are split at unfortunate positions
+      # The pattern {"{key should be {"key
+      if args_str.start_with?('{"{')
+        fixed = args_str.sub(/^\{"\{/, '{"')
+        Rails.logger.warn("Fixed malformed JSON streaming bug: #{args_str[0..50].inspect} -> #{fixed[0..50].inspect}")
+        args_str = fixed
+      end
+      
       if !args_str.start_with?('{') && !args_str.end_with?('}')
         return "{#{args_str}}"
       elsif !args_str.start_with?('{')
