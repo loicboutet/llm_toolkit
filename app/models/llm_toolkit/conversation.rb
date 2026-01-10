@@ -473,11 +473,20 @@ module LlmToolkit
 
     def sanitize_tool_result_content(content, tool_name)
       return content if content.blank?
-      
+
       content_str = content.to_s
       max_size = LlmToolkit.config.max_tool_result_size
-      
-      if content_str.include?('image_base64') || content_str.include?('data:image')
+
+      # Only process screenshot/image data if it looks like actual base64 image data
+      # NOT just source code that mentions these terms
+      # 
+      # Detection criteria:
+      # 1. Must have a long base64 string (at least 1000 chars of base64 data)
+      # 2. Must be in a structured format (JSON or Ruby hash with specific keys)
+      #
+      # This prevents false positives when reading source code files that contain
+      # the words "image_base64" or "data:image" as literals
+      if looks_like_actual_screenshot_data?(content_str)
         if content_str =~ /:message\s*=>\s*"([^"]+)"/
           return "[Screenshot captured successfully] #{$1}"
         elsif content_str =~ /"message"\s*:\s*"([^"]+)"/
@@ -486,17 +495,46 @@ module LlmToolkit
           return "[Screenshot captured successfully - image sent separately for visual analysis]"
         end
       end
-      
-      if content_str.include?('data:application/pdf;base64')
+
+      # Same for PDF - only match actual base64 PDF data, not source code mentioning it
+      if looks_like_actual_pdf_data?(content_str)
         return "[PDF content processed - base64 data removed for brevity]"
       end
-      
+
       if content_str.length > max_size
         Rails.logger.warn("Truncating large tool result for #{tool_name}: #{content_str.length} chars -> #{max_size} chars")
         return content_str[0...max_size] + "\n\n[... content truncated due to size ...]"
       end
-      
+
       content_str
+    end
+
+    # Check if content looks like actual screenshot/image data (not source code)
+    # Real screenshot data will have:
+    # - A long base64 string (images are typically > 10KB = 13K+ base64 chars)
+    # - Structured format with data field containing the base64
+    def looks_like_actual_screenshot_data?(content_str)
+      return false unless content_str.include?('image_base64') || content_str.include?('data:image')
+
+      # Check for actual base64 data pattern: a long string of base64 characters
+      # Real image base64 will have 10,000+ chars of continuous base64
+      # Source code mentioning "image_base64" will not have this pattern
+      has_long_base64 = content_str =~ /[A-Za-z0-9+\/]{1000,}={0,2}/
+
+      # Also check it's in a data structure format (JSON or Ruby hash)
+      # with keys that indicate it's screenshot result data
+      has_data_structure = content_str =~ /["']?(?:data|image_base64|screenshot)["']?\s*[=:>]/i
+
+      has_long_base64 && has_data_structure
+    end
+
+    # Check if content looks like actual PDF base64 data (not source code)
+    def looks_like_actual_pdf_data?(content_str)
+      return false unless content_str.include?('data:application/pdf;base64')
+
+      # Real PDF base64 will have thousands of chars after the prefix
+      # Match the data URI followed by a long base64 string
+      content_str =~ /data:application\/pdf;base64,[A-Za-z0-9+\/]{1000,}={0,2}/
     end
 
     def format_non_coder_tool_results(tool_uses)
