@@ -266,7 +266,8 @@ module LlmToolkit
       # Case 1: Handle unclosed strings FIRST (before adding braces)
       # This must be done before brace fixes because adding } to an unclosed string
       # would make it worse (e.g., '{"path": "/tmp' -> '{"path": "/tmp}' is still invalid)
-      if args_str.count('"') % 2 == 1
+      # IMPORTANT: We must count only UNESCAPED quotes, not escaped ones like \"
+      if count_unescaped_quotes(args_str).odd?
         args_str = "#{args_str}\""
         Rails.logger.warn("[FIX_JSON] Added closing quote for unclosed string")
       end
@@ -287,6 +288,25 @@ module LlmToolkit
       end
       
       args_str
+    end
+
+    # Count only unescaped double quotes in a string
+    # Escaped quotes (like \") should not be counted as they don't affect JSON validity
+    def count_unescaped_quotes(str)
+      count = 0
+      i = 0
+      while i < str.length
+        if str[i] == '\\' && i + 1 < str.length
+          # Skip the next character (it's escaped)
+          i += 2
+        elsif str[i] == '"'
+          count += 1
+          i += 1
+        else
+          i += 1
+        end
+      end
+      count
     end
 
     def parse_tool_arguments(arguments_str)
