@@ -697,7 +697,18 @@ module LlmToolkit
           
           if tool_call['function']['arguments']
             existing_tool_call['function']['arguments'] ||= ''
-            existing_tool_call['function']['arguments'] += tool_call['function']['arguments']
+            incoming = tool_call['function']['arguments']
+            existing = existing_tool_call['function']['arguments']
+            
+# FIX: Detect and fix streaming chunk bug where second chunk incorrectly starts with "{"
+            # Pattern: existing is '{"' and incoming starts with '{"' 
+            # This creates malformed JSON like '{"{command' instead of '{"command'
+            if existing.strip == '{"' && incoming.start_with?('{"')
+              incoming = incoming[2..-1] || ''
+              Rails.logger.warn("[STREAM_FIX] Fixed duplicate JSON opening brace")
+            end
+            
+            existing_tool_call['function']['arguments'] += incoming
           end
         end
       end
