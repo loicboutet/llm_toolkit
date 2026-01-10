@@ -194,6 +194,41 @@ module LlmToolkit
       LlmToolkit::LlmModel.ordered.first&.id
     end
     
+    # Append context window information to the system prompt
+    # This is added dynamically (not cached) so the LLM knows current token usage
+    def append_context_window_info(sys_prompt)
+      # Only add context info if conversation supports it
+      return sys_prompt unless @conversation.respond_to?(:context_window_info)
+      
+      # Don't add context info for sub-agent conversations (they handle their own context)
+      return sys_prompt if @conversation.respond_to?(:sub_agent?) && @conversation.sub_agent?
+      
+      context_info = @conversation.context_window_info
+      return sys_prompt if context_info.blank?
+      
+      # Append to the first system message (which should be the base prompt)
+      if sys_prompt.is_a?(Array) && sys_prompt.any?
+        # Clone to avoid modifying original
+        modified_prompt = sys_prompt.map(&:deep_dup)
+        
+        # Find the first system message with text content
+        first_system = modified_prompt.first
+        if first_system[:content].is_a?(Array)
+          # Add context info to the first text block
+          first_text = first_system[:content].find { |c| c[:type] == 'text' }
+          if first_text
+            first_text[:text] = "#{first_text[:text]}\n\n#{context_info}"
+          end
+        elsif first_system[:content].is_a?(String)
+          first_system[:content] = "#{first_system[:content]}\n\n#{context_info}"
+        end
+        
+        modified_prompt
+      else
+        sys_prompt
+      end
+    end
+    
     # Handle cancellation by cleaning up and marking the message
     def handle_cancellation
       if @current_message
@@ -225,6 +260,10 @@ module LlmToolkit
                    else
                       []
                     end
+      
+      # Append context window info to system prompt if available
+      # This helps the LLM know when to use continue_conversation tool
+      sys_prompt = append_context_window_info(sys_prompt)
 
       # Get conversation history, formatted for the specific model's provider type
       conv_history = @conversation.history(llm_model: @llm_model)
