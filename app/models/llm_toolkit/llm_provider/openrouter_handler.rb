@@ -700,12 +700,29 @@ module LlmToolkit
             incoming = tool_call['function']['arguments']
             existing = existing_tool_call['function']['arguments']
             
-# FIX: Detect and fix streaming chunk bug where second chunk incorrectly starts with "{"
-            # Pattern: existing is '{"' and incoming starts with '{"' 
+# FIX: Detect and fix streaming chunk bug where chunks incorrectly duplicate JSON opening
+            # Pattern 1: existing is '{"' and incoming starts with '{"' 
+            # Pattern 2: existing ends with '{"' and incoming starts with '{"'
+            # Pattern 3: existing is just '{' and incoming starts with '{"'
             # This creates malformed JSON like '{"{command' instead of '{"command'
+            
+            # Debug: Log when we have short existing to understand the pattern
+            if existing.length > 0 && existing.length < 20 && incoming.start_with?('{')
+              Rails.logger.info("[STREAM_DEBUG] existing=#{existing.inspect} incoming_start=#{incoming[0..30].inspect}")
+            end
+            
+            # Fix pattern 1: existing is exactly '{"'
             if existing.strip == '{"' && incoming.start_with?('{"')
               incoming = incoming[2..-1] || ''
-              Rails.logger.warn("[STREAM_FIX] Fixed duplicate JSON opening brace")
+              Rails.logger.warn("[STREAM_FIX] Fixed duplicate JSON opening (pattern 1)")
+            # Fix pattern 2: existing ends with '{"' and incoming starts with '{"'
+            elsif existing.end_with?('{"') && incoming.start_with?('{"')
+              incoming = incoming[2..-1] || ''
+              Rails.logger.warn("[STREAM_FIX] Fixed duplicate JSON opening (pattern 2)")
+            # Fix pattern 3: existing is just '{' and incoming starts with '{"'
+            elsif existing.strip == '{' && incoming.start_with?('{"')
+              incoming = incoming[1..-1] || ''
+              Rails.logger.warn("[STREAM_FIX] Fixed duplicate JSON opening (pattern 3)")
             end
             
             existing_tool_call['function']['arguments'] += incoming

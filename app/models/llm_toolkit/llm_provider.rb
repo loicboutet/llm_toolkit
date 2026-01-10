@@ -251,6 +251,7 @@ module LlmToolkit
     end
 
     def fix_malformed_json(args_str)
+      Rails.logger.warn("[FIX_JSON_ENTRY] Called with: #{args_str[0..50].inspect}")
       # Case 0: Fix streaming chunk accumulation bug
       # Sometimes streaming chunks get concatenated incorrectly, resulting in patterns like:
       # - {"{command": ... (extra { after the opening {")
@@ -262,6 +263,15 @@ module LlmToolkit
         args_str = fixed
       end
       
+      # Case 1: Handle unclosed strings FIRST (before adding braces)
+      # This must be done before brace fixes because adding } to an unclosed string
+      # would make it worse (e.g., '{"path": "/tmp' -> '{"path": "/tmp}' is still invalid)
+      if args_str.count('"') % 2 == 1
+        args_str = "#{args_str}\""
+        Rails.logger.warn("[FIX_JSON] Added closing quote for unclosed string")
+      end
+      
+      # Case 2: Fix missing braces
       if !args_str.start_with?('{') && !args_str.end_with?('}')
         return "{#{args_str}}"
       elsif !args_str.start_with?('{')
@@ -270,16 +280,10 @@ module LlmToolkit
         return "#{args_str}}"
       end
       
-      # Case 2: Try to detect and complete partial "query" format
+      # Case 3: Try to detect and complete partial "query" format
       # Common pattern: "y": "something"
       if args_str.match(/^y["']?\s*:\s*["']/)
         return "{\"quer#{args_str}}"
-      end
-      
-      # Case 3: Handle unclosed strings
-      # This is hard to fix perfectly, but we can try a simple approach
-      if args_str.count('"') % 2 == 1
-        return "#{args_str}\""
       end
       
       args_str
