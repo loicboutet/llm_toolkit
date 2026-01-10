@@ -211,6 +211,11 @@ module LlmToolkit
         # Fix common issues with the arguments string
         args_str = tc['function']['arguments'].strip
         
+        # Log for debugging the streaming bug
+        if args_str.start_with?('{"{')
+          Rails.logger.warn("[TOOL_ARGS_DEBUG] Detected malformed pattern BEFORE fix: #{args_str[0..100].inspect}")
+        end
+        
         # If arguments string is empty, initialize it to empty object
         if args_str.empty?
           tc['function']['arguments'] = '{}'
@@ -219,6 +224,11 @@ module LlmToolkit
         
         # Try to fix malformed JSON
         tc['function']['arguments'] = fix_malformed_json(args_str)
+        
+        # Log after fix
+        if tc['function']['arguments'].start_with?('{"{')
+          Rails.logger.error("[TOOL_ARGS_DEBUG] STILL malformed AFTER fix: #{tc['function']['arguments'][0..100].inspect}")
+        end
       end
       
       # PHASE 3: Parse arguments into proper input hash
