@@ -97,14 +97,15 @@ module LlmToolkit
         raise ApiError, "Network error: #{e.message}"
       end
 
+      # Retry configuration for transient errors
+      STREAMING_MAX_RETRIES = 3
+      STREAMING_RETRY_BASE_DELAY = 1.0 # seconds
+      STREAMING_RETRY_MAX_DELAY = 8.0 # seconds
+      
+      # HTTP status codes that should trigger a retry
+      RETRYABLE_STATUS_CODES = [500, 502, 503, 504, 520, 521, 522, 523, 524, 529].freeze
+      
       def stream_openrouter(llm_model, system_messages, conversation_history, tools = nil, &block)
-        client = Faraday.new(url: 'https://openrouter.ai/api/v1') do |f|
-          f.request :json
-          f.adapter Faraday.default_adapter
-          f.options.timeout = 600
-          f.options.open_timeout = 10
-        end
-
         formatted_system_messages = format_system_messages_for_openrouter(system_messages)
         fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
         messages = formatted_system_messages + fixed_conversation_history
@@ -136,6 +137,144 @@ module LlmToolkit
           Rails.logger.debug "OPENROUTER STREAMING REQUEST BODY: #{JSON.pretty_generate(sanitized_body)}"
         end
 
+        # Execute with retry logic
+        execute_streaming_request_with_retry(
+          model_name: model_name,
+          request_body: request_body,
+          messages_count: messages.size,
+          tools_count: request_body[:tools]&.size || 0,
+          &block
+        )
+      end
+
+      # Execute the streaming request with retry logic for transient failures
+      #
+      # @param model_name [String] The model name for logging
+      # @param request_body [Hash] The request body to send
+      # @param messages_count [Integer] Number of messages for logging
+      # @param tools_count [Integer] Number of tools for logging
+      # @param block [Proc] Block to process streaming chunks
+      # @return [Hash] The final response
+      def execute_streaming_request_with_retry(model_name:, request_body:, messages_count:, tools_count:, &block)
+        attempt = 0
+        last_error = nil
+        last_status = nil
+        
+        while attempt < STREAMING_MAX_RETRIES
+          attempt += 1
+          
+          begin
+            Rails.logger.info("[STREAMING RETRY] Attempt #{attempt}/#{STREAMING_MAX_RETRIES} for model #{model_name}")
+            
+            result = execute_single_streaming_request(
+              model_name: model_name,
+              request_body: request_body,
+              messages_count: messages_count,
+              tools_count: tools_count,
+              &block
+            )
+            
+            # Success! Return the result
+            if attempt > 1
+              Rails.logger.info("[STREAMING RETRY] Succeeded on attempt #{attempt} after #{attempt - 1} retries")
+            end
+            
+            return result
+            
+          rescue RetryableStreamingError => e
+            last_error = e
+            last_status = e.status_code
+            
+            if attempt < STREAMING_MAX_RETRIES
+              delay = calculate_retry_delay(attempt)
+              Rails.logger.warn("[STREAMING RETRY] Attempt #{attempt} failed with retryable error: #{e.message}. " \
+                                "Retrying in #{delay}s...")
+              sleep(delay)
+            else
+              Rails.logger.error("[STREAMING RETRY] All #{STREAMING_MAX_RETRIES} attempts failed. Last error: #{e.message}")
+            end
+            
+          rescue NonRetryableStreamingError => e
+            # Don't retry client errors (4xx)
+            Rails.logger.error("[STREAMING RETRY] Non-retryable error: #{e.message}")
+            
+            NexraiErrorTracker.capture_message(
+              "API streaming error (non-retryable): #{e.status_code}",
+              level: :error,
+              context: {
+                provider: 'openrouter',
+                model: model_name,
+                status_code: e.status_code,
+                error_detail: e.message,
+                messages_count: messages_count,
+                tools_count: tools_count
+              }
+            )
+            
+            raise ApiError, "API streaming error: #{e.message}"
+          end
+        end
+        
+        # All retries exhausted
+        NexraiErrorTracker.capture_message(
+          "API streaming error after #{STREAMING_MAX_RETRIES} retries",
+          level: :error,
+          context: {
+            provider: 'openrouter',
+            model: model_name,
+            status_code: last_status,
+            error_detail: last_error&.message,
+            messages_count: messages_count,
+            tools_count: tools_count,
+            retry_attempts: STREAMING_MAX_RETRIES
+          }
+        )
+        
+        raise ApiError, "API streaming error after #{STREAMING_MAX_RETRIES} retries: #{last_error&.message}"
+      end
+      
+      # Calculate delay for exponential backoff with jitter
+      # @param attempt [Integer] Current attempt number (1-based)
+      # @return [Float] Delay in seconds
+      def calculate_retry_delay(attempt)
+        # Exponential backoff: base_delay * 2^(attempt-1)
+        delay = STREAMING_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        # Cap at max delay
+        delay = [delay, STREAMING_RETRY_MAX_DELAY].min
+        # Add jitter (±25%)
+        jitter = delay * 0.25 * (rand * 2 - 1)
+        delay + jitter
+      end
+      
+      # Internal error class for retryable errors (network issues, 5xx errors)
+      class RetryableStreamingError < StandardError
+        attr_reader :status_code
+        
+        def initialize(message, status_code = nil)
+          super(message)
+          @status_code = status_code
+        end
+      end
+      
+      # Internal error class for non-retryable errors (4xx client errors)
+      class NonRetryableStreamingError < StandardError
+        attr_reader :status_code
+        
+        def initialize(message, status_code = nil)
+          super(message)
+          @status_code = status_code
+        end
+      end
+      
+      # Execute a single streaming request (without retry logic)
+      def execute_single_streaming_request(model_name:, request_body:, messages_count:, tools_count:, &block)
+        client = Faraday.new(url: 'https://openrouter.ai/api/v1') do |f|
+          f.request :json
+          f.adapter Faraday.default_adapter
+          f.options.timeout = 600
+          f.options.open_timeout = 10
+        end
+
         streaming_state = {
           accumulated_content: "",
           tool_calls: [],
@@ -160,25 +299,16 @@ module LlmToolkit
         
         process_remaining_buffer(streaming_state, &block)
         
+        # Check for error responses
         unless (200..299).cover?(response.status)
           error_detail = streaming_state[:api_error] || "Status #{response.status}"
-          Rails.logger.error("OpenRouter API streaming error: #{error_detail}")
           
-          # Track the error for monitoring
-          NexraiErrorTracker.capture_message(
-            "API streaming error: Status #{response.status}",
-            level: :error,
-            context: {
-              provider: 'openrouter',
-              model: model_name,
-              status_code: response.status,
-              error_detail: error_detail,
-              messages_count: messages.size,
-              tools_count: request_body[:tools]&.size || 0
-            }
-          )
-          
-          raise ApiError, "API streaming error: #{error_detail}"
+          # Determine if error is retryable
+          if RETRYABLE_STATUS_CODES.include?(response.status)
+            raise RetryableStreamingError.new(error_detail, response.status)
+          else
+            raise NonRetryableStreamingError.new(error_detail, response.status)
+          end
         end
         
         formatted_tool_calls = format_tools_response_from_openrouter(streaming_state[:tool_calls]) if streaming_state[:tool_calls].any?
@@ -196,22 +326,17 @@ module LlmToolkit
           'finish_reason' => streaming_state[:finish_reason],
           'generation_id' => streaming_state[:generation_id]
         }
+      rescue Faraday::TimeoutError, Faraday::ConnectionFailed, Faraday::SSLError => e
+        # Network errors are retryable
+        Rails.logger.warn("[STREAMING] Network error: #{e.class.name} - #{e.message}")
+        raise RetryableStreamingError.new("Network error: #{e.message}")
+        
       rescue Faraday::Error => e
-        Rails.logger.error("OpenRouter API streaming error: #{e.message}")
+        # Other Faraday errors - check if they might be retryable
+        Rails.logger.error("[STREAMING] Faraday error: #{e.class.name} - #{e.message}")
         
-        # Track network errors for monitoring
-        NexraiErrorTracker.capture_exception(
-          e,
-          context: {
-            provider: 'openrouter',
-            model: model_name,
-            error_type: 'network_error',
-            messages_count: messages.size,
-            tools_count: request_body[:tools]&.size || 0
-          }
-        )
-        
-        raise ApiError, "Network error during streaming: #{e.message}"
+        # Default to retryable for unknown Faraday errors
+        raise RetryableStreamingError.new("Network error: #{e.message}")
       end
       
       private

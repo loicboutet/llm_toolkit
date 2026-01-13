@@ -88,14 +88,33 @@ module LlmToolkit
         Rails.logger.info("[STREAMING SERVICE] Conversation #{@conversation.id} was cancelled: #{e.message}")
         handle_cancellation
         false
+      rescue LlmToolkit::LlmProvider::ApiError => e
+        # Handle API errors with user-friendly messages
+        Rails.logger.error("[STREAMING SERVICE] API Error: #{e.message}")
+        Rails.logger.error(e.backtrace.first(10).join("\n"))
+        
+        friendly_message = translate_api_error_for_user(e.message)
+        
+        if @current_message
+          @current_message.update(
+            content: friendly_message,
+            is_error: true,
+            finish_reason: 'error'
+          )
+        end
+        
+        false
       rescue => e
         Rails.logger.error("Error in CallStreamingLlmWithToolService: #{e.message}")
         Rails.logger.error(e.backtrace.join("\n"))
         
-        # Update message with error info if empty
-        if @current_message && @current_message.content.blank?
+        # Update message with error info
+        if @current_message
+          friendly_message = translate_api_error_for_user(e.message)
           @current_message.update(
-            content: "Sorry, an error occurred: #{e.message.truncate(200)}"
+            content: friendly_message,
+            is_error: true,
+            finish_reason: 'error'
           )
         end
         
@@ -114,6 +133,36 @@ module LlmToolkit
     end
 
     private
+    
+    # Translate API error messages to user-friendly French messages
+    # @param error_message [String] The raw error message from the API
+    # @return [String] A user-friendly message in French
+    def translate_api_error_for_user(error_message)
+      case error_message
+      when /after \d+ retries/i
+        "⚠️ Le service est temporairement indisponible après plusieurs tentatives. Veuillez réessayer dans quelques instants."
+      when /timeout/i, /timed out/i
+        "⚠️ La requête a pris trop de temps. Le service est peut-être surchargé. Veuillez réessayer."
+      when /network error/i, /connection/i
+        "⚠️ Erreur de connexion au service. Veuillez vérifier votre connexion et réessayer."
+      when /rate limit/i, /too many requests/i, /429/
+        "⚠️ Trop de requêtes envoyées. Veuillez patienter quelques instants avant de réessayer."
+      when /authentication/i, /unauthorized/i, /401/
+        "⚠️ Erreur d'authentification avec le service. Veuillez contacter l'administrateur."
+      when /Status 5\d\d/, /500|502|503|504/
+        "⚠️ Le serveur rencontre des difficultés techniques. Veuillez réessayer dans quelques instants."
+      when /context.*too long/i, /maximum context length/i, /413/
+        "⚠️ La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
+      when /invalid.*request/i, /400/
+        "⚠️ Une erreur de format s'est produite. Veuillez réessayer ou démarrer une nouvelle conversation."
+      when /tool.*not.*support/i
+        "⚠️ Le modèle sélectionné ne prend pas en charge cette fonctionnalité."
+      when /content.*filter/i, /safety/i
+        "⚠️ Le contenu a été filtré pour des raisons de sécurité."
+      else
+        "⚠️ Une erreur s'est produite: #{error_message.truncate(150)}. Veuillez réessayer."
+      end
+    end
     
     # Broadcast form update after conversation completes
     # This ensures the form switches from Cancel to Send button
