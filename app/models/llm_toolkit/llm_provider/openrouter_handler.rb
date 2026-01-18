@@ -519,75 +519,45 @@ module LlmToolkit
       #   [3] assistant "here's what I found"
       #   [4] user "thanks"                <- BREAKPOINT 3 (last with content)
       #
+      # Find cache breakpoint indices for Anthropic prompt caching.
+      #
+      # HOW ANTHROPIC CACHING WORKS:
+      # - Anthropic caches the PREFIX up to each cache_control marker
+      # - To READ a cache, you need a marker at the SAME position as before
+      # - To CREATE a new cache, you add a marker at the end
+      #
+      # CORRECT STRATEGY:
+      # 1. First user message - caches [system prompt + first user message]
+      # 2. Second-to-last message - READ point (matches last turn's creation point)
+      # 3. Last message - CREATE point (for next turn to read)
+      #
+      # This ensures that:
+      # - Turn N creates cache at position X (last message)
+      # - Turn N+1 reads cache at position X (now second-to-last) ✓ MATCH!
+      # - Turn N+1 creates new cache at position X+1 (new last message)
+      #
       def find_cache_breakpoint_indices(messages)
         return [] if messages.empty?
         
         cache_indices = []
+        last_idx = messages.size - 1
         
-        # 1. First user message (stable anchor)
+        # 1. First user message (stable anchor for system prompt caching)
         first_user_idx = messages.index { |m| m[:role] == 'user' }
         cache_indices << first_user_idx if first_user_idx
         
-        # 2. Last tool message with content
-        last_tool_idx = nil
-        messages.each_with_index do |msg, idx|
-          if msg[:role] == 'tool'
-            content = msg[:content]
-            has_content = content.present? && content.to_s.strip.length > 0
-            last_tool_idx = idx if has_content
-          end
-        end
-        cache_indices << last_tool_idx if last_tool_idx
-        
-        # 3. Last non-tool message with actual content (after the last tool)
-        last_with_content_idx = nil
-        messages.each_with_index do |msg, idx|
-          next if msg[:role] == 'tool'
-          
-          content = msg[:content]
-          has_content = false
-          
-          if content.is_a?(String)
-            has_content = content.present? && content.strip.length > 0
-          elsif content.is_a?(Array)
-            has_content = content.any? { |item| 
-              text = get_text_from_item(item)
-              text.present? && text.strip.length > 0
-            }
-          end
-          
-          # Only consider if it's after the last tool (or if no tool)
-          if has_content && (last_tool_idx.nil? || idx > last_tool_idx)
-            last_with_content_idx = idx
-          end
+        # 2. Second-to-last message (READ point - matches previous turn's CREATE point)
+        if last_idx >= 2
+          second_to_last_idx = last_idx - 1
+          cache_indices << second_to_last_idx
         end
         
-        if last_with_content_idx && !cache_indices.include?(last_with_content_idx)
-          cache_indices << last_with_content_idx
+        # 3. Last message (CREATE point - for next turn to read)
+        if last_idx >= 1
+          cache_indices << last_idx
         end
         
-        # 4. For very long conversations, add a middle breakpoint
-        all_with_content = []
-        messages.each_with_index do |msg, idx|
-          content = msg[:content]
-          has_content = if msg[:role] == 'tool'
-                          content.present? && content.to_s.strip.length > 0
-                        elsif content.is_a?(String)
-                          content.present? && content.strip.length > 0
-                        elsif content.is_a?(Array)
-                          content.any? { |i| get_text_from_item(i).present? }
-                        else
-                          false
-                        end
-          all_with_content << idx if has_content
-        end
-        
-        if all_with_content.size > 15
-          middle_idx = all_with_content[all_with_content.size / 2]
-          cache_indices << middle_idx unless cache_indices.include?(middle_idx)
-        end
-        
-        # Sort and limit to 3 (Anthropic allows 4 total, 1 for system)
+        # Sort, dedupe, and limit to 3 (Anthropic allows 4 total, 1 for system)
         cache_indices = cache_indices.compact.uniq.sort.first(3)
         
         cache_indices
