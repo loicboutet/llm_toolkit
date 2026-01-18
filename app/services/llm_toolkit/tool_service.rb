@@ -130,33 +130,25 @@ module LlmToolkit
     end
     
     # Format the tool result content to ensure it's a valid string for OpenRouter
+    # IMPORTANT: This method converts tool execution results to a string format
+    # that can be sent back to the LLM. The LLM needs ALL the data, not just
+    # a summary message.
     def self.format_tool_result_content(result)
       if result.is_a?(String)
         # If the result is already a string, use it directly
         return result
       elsif result.is_a?(Hash)
-        if result[:result].present?
-          # Handle result hash format  
-          # ✅ FIXED: Always return the inner result as-is if it's a string
-          inner_result = result[:result]
-          
-          if inner_result.is_a?(String)
-            # For strings, return directly without conversion
-            return inner_result
-          elsif inner_result.is_a?(Hash) || inner_result.is_a?(Array)
-            # For complex data structures, convert to a readable string format
-            # rather than Ruby's inspect format which includes symbols
-            return JSON.pretty_generate(inner_result) rescue inner_result.to_s
-          else
-            # For other simple values, convert to string
-            return inner_result.to_s
-          end
-        elsif result[:error].present?
-          # Handle error hash format
-          return "Error: #{result[:error]}"
+        if result[:error].present?
+          # Handle error hash format - still include full context
+          error_result = { error: result[:error] }
+          # Include any additional context that might help debug
+          result.except(:error).each { |k, v| error_result[k] = v }
+          return JSON.pretty_generate(error_result) rescue "Error: #{result[:error]}"
         else
-          # Handle empty hash
-          return result.to_json
+          # FIXED: Return the ENTIRE hash as JSON, not just the :result key
+          # The LLM needs all the data (runs, workflows, pagination info, etc.)
+          # not just the summary message in :result
+          return JSON.pretty_generate(result) rescue result.to_json
         end
       elsif result.is_a?(Array)
         # Handle array results by converting to JSON
