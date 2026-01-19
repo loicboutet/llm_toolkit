@@ -243,39 +243,62 @@ module LlmToolkit
       LlmToolkit::LlmModel.ordered.first&.id
     end
     
-    # Append context window information to the system prompt
-    # This is added dynamically (not cached) so the LLM knows current token usage
-    def append_context_window_info(sys_prompt)
+    # Append context window information to the LAST USER MESSAGE in conversation history
+    # 
+    # WHY NOT SYSTEM PROMPT:
+    # Adding dynamic info (token counts, timestamps) to the system prompt BREAKS Anthropic's
+    # prompt caching because the cache key includes the system prompt content. When it changes,
+    # the entire cache is invalidated.
+    #
+    # SOLUTION:
+    # Add context_window_info to the LAST user message instead. This message is at the end
+    # of the conversation, AFTER all cache breakpoints, so it doesn't affect cache validity.
+    #
+    def append_context_window_info_to_history(conv_history)
       # Only add context info if conversation supports it
-      return sys_prompt unless @conversation.respond_to?(:context_window_info)
+      return conv_history unless @conversation.respond_to?(:context_window_info)
       
       # Don't add context info for sub-agent conversations (they handle their own context)
-      return sys_prompt if @conversation.respond_to?(:sub_agent?) && @conversation.sub_agent?
+      return conv_history if @conversation.respond_to?(:sub_agent?) && @conversation.sub_agent?
       
       context_info = @conversation.context_window_info
-      return sys_prompt if context_info.blank?
+      return conv_history if context_info.blank?
       
-      # Append to the first system message (which should be the base prompt)
-      if sys_prompt.is_a?(Array) && sys_prompt.any?
-        # Clone to avoid modifying original
-        modified_prompt = sys_prompt.map(&:deep_dup)
-        
-        # Find the first system message with text content
-        first_system = modified_prompt.first
-        if first_system[:content].is_a?(Array)
-          # Add context info to the first text block
-          first_text = first_system[:content].find { |c| c[:type] == 'text' }
-          if first_text
-            first_text[:text] = "#{first_text[:text]}\n\n#{context_info}"
-          end
-        elsif first_system[:content].is_a?(String)
-          first_system[:content] = "#{first_system[:content]}\n\n#{context_info}"
+      # Find the last user message in the conversation history
+      return conv_history if conv_history.blank?
+      
+      # Clone to avoid modifying original
+      modified_history = conv_history.map(&:deep_dup)
+      
+      # Find the last user message (searching from the end)
+      last_user_idx = modified_history.rindex { |msg| msg[:role] == 'user' }
+      return conv_history unless last_user_idx
+      
+      last_user_msg = modified_history[last_user_idx]
+      
+      # Append context info to the last user message content
+      if last_user_msg[:content].is_a?(Array)
+        # Array format: find the last text block and append
+        last_text = last_user_msg[:content].reverse.find { |c| c[:type] == 'text' }
+        if last_text
+          last_text[:text] = "#{last_text[:text]}\n\n#{context_info}"
+        else
+          # No text block found, add one
+          last_user_msg[:content] << { type: 'text', text: context_info }
         end
-        
-        modified_prompt
-      else
-        sys_prompt
+      elsif last_user_msg[:content].is_a?(String)
+        last_user_msg[:content] = "#{last_user_msg[:content]}\n\n#{context_info}"
       end
+      
+      modified_history
+    end
+    
+    # DEPRECATED: Keep for reference but don't use
+    # Adding to system prompt breaks caching!
+    def append_context_window_info(sys_prompt)
+      # DISABLED - this breaks caching because system prompt changes invalidate cache
+      # Use append_context_window_info_to_history instead
+      sys_prompt
     end
     
     # Handle cancellation by cleaning up and marking the message
@@ -310,12 +333,12 @@ module LlmToolkit
                       []
                     end
       
-      # Append context window info to system prompt if available
-      # This helps the LLM know when to use continue_conversation tool
-      sys_prompt = append_context_window_info(sys_prompt)
-
       # Get conversation history, formatted for the specific model's provider type
       conv_history = @conversation.history(llm_model: @llm_model)
+      
+      # Append context window info to LAST USER MESSAGE (not system prompt!)
+      # This preserves cache validity - system prompt stays stable
+      conv_history = append_context_window_info_to_history(conv_history)
       
       # IMPORTANT: Capture the message that will receive usage data BEFORE streaming
       # This ensures tokens go to the correct message even if followup_with_tools changes @current_message
