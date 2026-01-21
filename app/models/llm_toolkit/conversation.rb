@@ -216,7 +216,7 @@ module LlmToolkit
       end
 
       # Filter out empty messages, but NEVER filter out 'tool' messages
-      return history_messages.reject do |msg|
+      filtered_messages = history_messages.reject do |msg|
         next false if msg[:role] == 'tool'
         
         is_empty_non_user = msg[:role] != 'user' && msg[:content].blank? && msg[:tool_calls].blank?
@@ -227,9 +227,60 @@ module LlmToolkit
                         end
         is_empty_non_user || is_empty_user
       end
+      
+      # Repair invalid sequences: tool -> user must have an assistant message in between
+      repair_tool_user_sequences(filtered_messages, provider_type)
     end
 
     private
+
+    # Repairs invalid message sequences where a tool result is followed directly by a user message
+    # without an assistant response in between. This can happen when:
+    # 1. An error occurs during the followup call after a tool execution
+    # 2. The error message is saved with is_error: true (and thus excluded from history)
+    # 3. The user sends a new message
+    # Result: tool -> user (invalid for OpenAI/OpenRouter API which expects tool -> assistant -> user)
+    #
+    # This method injects a synthetic assistant message to make the sequence valid.
+    def repair_tool_user_sequences(messages, provider_type)
+      return messages if messages.empty?
+      
+      repaired = []
+      
+      messages.each_with_index do |msg, i|
+        # Check if we need to inject a synthetic assistant message
+        if i > 0 && msg[:role] == 'user'
+          prev_msg = repaired.last
+          
+          if prev_msg && prev_msg[:role] == 'tool'
+            # Invalid sequence detected: tool -> user
+            # Inject a synthetic assistant message
+            Rails.logger.warn("[CONVERSATION HISTORY REPAIR] Detected invalid tool->user sequence at index #{i}, injecting synthetic assistant message")
+            
+            synthetic_assistant = build_synthetic_assistant_message(provider_type)
+            repaired << synthetic_assistant
+          end
+        end
+        
+        repaired << msg
+      end
+      
+      repaired
+    end
+    
+    # Builds a synthetic assistant message to repair broken sequences
+    def build_synthetic_assistant_message(provider_type)
+      content = "[Une erreur s'est produite lors du traitement précédent. Veuillez continuer.]"
+      
+      case provider_type
+      when "anthropic"
+        { role: "assistant", content: content }
+      when "openrouter"
+        { role: "assistant", content: content }
+      else
+        { role: "assistant", content: content }
+      end
+    end
 
     def get_default_provider
       if conversable.respond_to?(conversable.class.get_default_llm_provider_method)
