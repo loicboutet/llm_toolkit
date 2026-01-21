@@ -24,9 +24,9 @@ module LlmToolkit
       message.stubs(:conversation).returns(conversation)
       conversation.stubs(:conversable).returns(conversable)
       
-      # Mock the tool class
+      # Mock the tool class - now accepts tool_use parameter too
       test_tool = mock('TestTool')
-      test_tool.stubs(:execute).with(conversable: conversable, args: {}).returns({ result: "test result" })
+      test_tool.stubs(:execute).with(conversable: conversable, args: {}, tool_use: tool_use).returns({ result: "test result" })
       
       # Mock finding the tool
       LlmToolkit::Tools::AbstractTool.stubs(:find_tool).with('test_tool').returns(test_tool)
@@ -50,9 +50,9 @@ module LlmToolkit
       message.stubs(:conversation).returns(conversation)
       conversation.stubs(:conversable).returns(conversable)
       
-      # Mock the tool class
+      # Mock the tool class - now accepts tool_use parameter too
       test_tool = mock('TestTool')
-      test_tool.stubs(:execute).with(conversable: conversable, args: {}).returns({ result: "test result" })
+      test_tool.stubs(:execute).with(conversable: conversable, args: {}, tool_use: tool_use).returns({ result: "test result" })
       
       # Mock finding the tool
       LlmToolkit::Tools::AbstractTool.stubs(:find_tool).with('test_tool').returns(test_tool)
