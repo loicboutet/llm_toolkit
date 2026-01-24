@@ -21,7 +21,7 @@ module LlmToolkit
         Rails.logger.info("Anthropic - Tools count: #{all_tools.size}")
 
         model_name = llm_model.model_id.presence || llm_model.name
-        max_tokens = settings&.dig('max_tokens').to_i || LlmToolkit.config.default_max_tokens
+        max_tokens = settings&.dig('max_tokens')&.to_i.presence || LlmToolkit.config.default_max_tokens
         Rails.logger.info("Anthropic - Using model: #{model_name}")
         Rails.logger.info("Anthropic - Max tokens: #{max_tokens}")
 
@@ -100,7 +100,7 @@ module LlmToolkit
         all_tools = tools.presence || LlmToolkit::ToolService.tool_definitions
         
         model_name = llm_model.model_id.presence || llm_model.name
-        max_tokens = settings&.dig('max_tokens').to_i || LlmToolkit.config.default_max_tokens
+        max_tokens = settings&.dig('max_tokens')&.to_i.presence || LlmToolkit.config.default_max_tokens
         
         Rails.logger.info("Anthropic Streaming - Using model: #{model_name}")
         Rails.logger.info("Anthropic Streaming - Max tokens: #{max_tokens}")

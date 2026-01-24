@@ -3,13 +3,15 @@ module LlmToolkit
     include SystemMessageFormatter
     include OpenrouterHandler
     include AnthropicHandler
+    include MistralHandler
+    include ScalewayHandler
     
     belongs_to :owner, polymorphic: true, optional: true
     has_many :llm_models, dependent: :destroy, class_name: 'LlmToolkit::LlmModel', foreign_key: 'llm_provider_id'
 
     validates :name, presence: true, uniqueness: { scope: [:owner_id, :owner_type] }
     validates :api_key, presence: true
-    validates :provider_type, presence: true, inclusion: { in: %w[anthropic openrouter] }
+    validates :provider_type, presence: true, inclusion: { in: %w[anthropic openrouter mistral scaleway] }
 
     class ApiError < StandardError; end
 
@@ -35,6 +37,10 @@ module LlmToolkit
         call_anthropic(target_llm_model, system_messages, conversation_history, tools)
       when 'openrouter'
         call_openrouter(target_llm_model, system_messages, conversation_history, tools)
+      when 'mistral'
+        call_mistral(target_llm_model, system_messages, conversation_history, tools)
+      when 'scaleway'
+        call_scaleway(target_llm_model, system_messages, conversation_history, tools)
       else
         raise ApiError, "Unsupported provider type: #{provider_type}"
       end
@@ -65,6 +71,10 @@ module LlmToolkit
         stream_anthropic(target_llm_model, system_messages, conversation_history, tools, &block)
       when 'openrouter'
         stream_openrouter(target_llm_model, system_messages, conversation_history, tools, &block)
+      when 'mistral'
+        stream_mistral(target_llm_model, system_messages, conversation_history, tools, &block)
+      when 'scaleway'
+        stream_scaleway(target_llm_model, system_messages, conversation_history, tools, &block)
       else
         raise ApiError, "Streaming not supported for provider type: #{provider_type}"
       end
