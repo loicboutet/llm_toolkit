@@ -9,6 +9,13 @@ module LlmToolkit
     # Default SolidQueue concurrency duration is only 3 minutes, which is too short
     limits_concurrency to: 1, key: ->(conversation_id, *) { "conversation_#{conversation_id}" }, duration: 60.minutes
 
+    # Threshold percentage of context window to trigger continuation warning
+    # At 90%, we inject a message telling the LLM to use continue_conversation
+    CONTEXT_WARNING_THRESHOLD_PERCENT = 90
+    
+    # Default context window size if model doesn't specify one
+    DEFAULT_CONTEXT_WINDOW = 200_000
+
     # Process streaming LLM requests asynchronously
     #
     # @param conversation_id [Integer] The ID of the conversation to process
@@ -43,6 +50,10 @@ module LlmToolkit
 
       # Use the original model - the assistant will call LovelaceCuaAssistant tool when it needs browser automation
       final_llm_model = original_llm_model
+
+      # 🚨 CHECK CONTEXT WINDOW LIMIT - Inject continuation warning if needed
+      # This MUST happen BEFORE creating the assistant message so the LLM sees the warning
+      inject_context_warning_if_needed(conversation, final_llm_model, tool_names, user_id)
 
       # Create initial status message
       initial_content = "🤔 Traitement de votre demande..."
@@ -94,6 +105,91 @@ module LlmToolkit
           is_error: true
         )
       end
+    end
+    
+    private
+    
+    # Check if we're approaching the context window limit and inject a warning message
+    # This forces the LLM to use continue_conversation before hitting the limit
+    #
+    # @param conversation [LlmToolkit::Conversation] The conversation
+    # @param llm_model [LlmToolkit::LlmModel] The LLM model being used
+    # @param tool_names [Array<String>] Available tool names
+    # @param user_id [Integer] The user ID
+    def inject_context_warning_if_needed(conversation, llm_model, tool_names, user_id)
+      # Skip if continue_conversation tool is not available
+      return unless tool_names.include?('continue_conversation')
+      
+      # Skip for sub-agent conversations (they manage their own context)
+      return if conversation.respond_to?(:sub_agent?) && conversation.sub_agent?
+      
+      # Get the context window limit for this model (with fallback)
+      max_context = llm_model.input_token_limit.presence || DEFAULT_CONTEXT_WINDOW
+      
+      # Calculate the warning threshold (90% by default)
+      warning_threshold = (max_context * CONTEXT_WARNING_THRESHOLD_PERCENT / 100.0).to_i
+      
+      # Estimate current context size
+      current_tokens = conversation.respond_to?(:estimate_current_context_size) ? 
+                       conversation.estimate_current_context_size : 0
+      
+      # Check if we've exceeded the threshold
+      return unless current_tokens >= warning_threshold
+      
+      usage_percent = ((current_tokens.to_f / max_context) * 100).round(1)
+      
+      Rails.logger.warn(
+        "[CONTEXT LIMIT] Conversation #{conversation.id} at #{usage_percent}% " \
+        "(#{current_tokens}/#{max_context} tokens). Injecting continuation warning."
+      )
+      
+      # Inject a system message forcing the LLM to continue
+      warning_message = build_context_warning_message(current_tokens, max_context, usage_percent)
+      
+      conversation.messages.create!(
+        role: 'user',
+        content: warning_message,
+        user_id: user_id
+      )
+      
+      Rails.logger.info("[CONTEXT LIMIT] Continuation warning injected for conversation #{conversation.id}")
+    end
+    
+    # Build the warning message content
+    #
+    # @param current_tokens [Integer] Current estimated token count
+    # @param max_context [Integer] Maximum context window size
+    # @param usage_percent [Float] Current usage percentage
+    # @return [String] The warning message
+    def build_context_warning_message(current_tokens, max_context, usage_percent)
+      <<~MESSAGE.strip
+        🚨 **ATTENTION CRITIQUE : LIMITE DE CONTEXTE ATTEINTE (#{usage_percent}%)**
+
+        Tu as utilisé ~#{format_number(current_tokens)} tokens sur #{format_number(max_context)} disponibles.
+
+        **⚠️ ACTION OBLIGATOIRE :**
+        Tu DOIS utiliser l'outil `continue_conversation` IMMÉDIATEMENT comme prochaine action.
+
+        **Instructions :**
+        1. NE réponds PAS à ce message avec du texte
+        2. Utilise DIRECTEMENT l'outil `continue_conversation`
+        3. Dans le summary, inclus :
+           - Ce qui a été accompli jusqu'ici
+           - L'état actuel du travail
+           - Les fichiers/chemins importants
+        4. Dans pending_tasks, décris précisément ce qu'il reste à faire
+        5. Dans important_context, liste les variables, chemins, ou détails critiques
+
+        **IMPORTANT :** Si tu ne continues pas maintenant, la conversation sera coupée et tout le contexte sera perdu.
+      MESSAGE
+    end
+    
+    # Format a number with spaces as thousands separator
+    #
+    # @param number [Integer] The number to format
+    # @return [String] Formatted number
+    def format_number(number)
+      number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1 ').reverse
     end
   end
 end
