@@ -19,10 +19,15 @@ module LlmToolkit
         messages = formatted_system_messages + fixed_conversation_history
 
         model_name = llm_model.model_id.presence || llm_model.name
-        # Determine max_tokens: use model's output_token_limit, settings override, or default
-        max_tokens = llm_model.output_token_limit.presence || 
-                     settings&.dig('max_tokens')&.to_i.presence || 
-                     LlmToolkit.config.default_max_tokens
+        # Determine max_tokens: use model's output_token_limit (if positive), settings override, or default
+        # We use > 0 check because 0 or nil should fall back to other options
+        max_tokens = if llm_model.output_token_limit.to_i > 0
+                       llm_model.output_token_limit
+                     elsif settings&.dig('max_tokens').to_i > 0
+                       settings.dig('max_tokens').to_i
+                     else
+                       LlmToolkit.config.default_max_tokens
+                     end
         Rails.logger.info("Using model: #{model_name}")
         Rails.logger.info("Max output tokens: #{max_tokens}")
 
@@ -117,10 +122,15 @@ module LlmToolkit
         model_name = llm_model.model_id.presence || llm_model.name
         Rails.logger.info("Using model: #{model_name}")
         
-        # Determine max_tokens: use model's output_token_limit, settings override, or default
-        max_tokens = llm_model.output_token_limit.presence || 
-                     settings&.dig('max_tokens')&.to_i.presence || 
-                     LlmToolkit.config.default_max_tokens
+        # Determine max_tokens: use model's output_token_limit (if positive), settings override, or default
+        # We use > 0 check because 0 or nil should fall back to other options
+        max_tokens = if llm_model.output_token_limit.to_i > 0
+                       llm_model.output_token_limit
+                     elsif settings&.dig('max_tokens').to_i > 0
+                       settings.dig('max_tokens').to_i
+                     else
+                       LlmToolkit.config.default_max_tokens
+                     end
         Rails.logger.info("Max output tokens: #{max_tokens}")
 
         request_body = {
