@@ -326,8 +326,10 @@ module LlmToolkit
       # Check for cancellation before starting
       check_cancellation!(@conversation)
       
-      # Get system prompt
-      sys_prompt = if @conversable.respond_to?(:generate_system_messages)
+      # Get system prompt - prefer effective_system_messages for cross-assistant support
+      sys_prompt = if @conversation.respond_to?(:effective_system_messages)
+                     @conversation.effective_system_messages(@role)
+                   elsif @conversable.respond_to?(:generate_system_messages)
                      @conversable.generate_system_messages(@role)
                    else
                       []
@@ -568,7 +570,10 @@ module LlmToolkit
       @is_placeholder_content = false # Follow-up messages don't have placeholders
       
       # Get updated conversation history with tool results
-      sys_prompt = if @conversable.respond_to?(:generate_system_messages)
+      # Prefer effective_system_messages for cross-assistant support
+      sys_prompt = if @conversation.respond_to?(:effective_system_messages)
+                     @conversation.effective_system_messages(@role)
+                   elsif @conversable.respond_to?(:generate_system_messages)
                      @conversable.generate_system_messages(@role)
                    else
                       []

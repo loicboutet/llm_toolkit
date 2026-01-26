@@ -133,6 +133,49 @@ module LlmToolkit
       status_resting? && messages.last&.is_error?
     end
 
+    # Check if the conversation is blocked due to context window limit being exceeded
+    # This happens when the last message is an error about token limit
+    #
+    # @return [Boolean] true if the conversation hit the context limit
+    def context_limit_exceeded?
+      return false unless status_resting?
+      
+      last_message = messages.order(created_at: :desc).first
+      return false unless last_message
+      
+      # Check if last message is an error about context limit
+      return true if last_message.is_error? && context_limit_error_message?(last_message.content)
+      
+      # Check if last message has finish_reason 'length' with empty content (token limit hit)
+      return true if last_message.finish_reason == 'length' && last_message.content.blank?
+      
+      # Check if last message contains the context limit error message
+      return true if context_limit_error_message?(last_message.content)
+      
+      false
+    end
+    
+    # Check if the message content indicates a context limit error
+    #
+    # @param content [String] The message content to check
+    # @return [Boolean] true if the content indicates a context limit error
+    def context_limit_error_message?(content)
+      return false if content.blank?
+      
+      error_patterns = [
+        /conversation.*trop longue/i,
+        /conversation.*too long/i,
+        /context.*too long/i,
+        /maximum context length/i,
+        /démarrer une nouvelle conversation/i,
+        /limite de tokens/i,
+        /token limit/i,
+        /context.*exhausted/i
+      ]
+      
+      error_patterns.any? { |pattern| content.match?(pattern) }
+    end
+
     # Returns an array of messages formatted for LLM providers
     def history(llm_model: nil)
       target_llm_model = llm_model || get_default_llm_model
