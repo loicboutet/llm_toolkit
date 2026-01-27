@@ -134,10 +134,62 @@ module LlmToolkit
 
     private
     
+    # Extract the actual error message from potentially nested JSON error responses
+    # OpenRouter/Anthropic errors often come as nested JSON with the real message buried inside
+    # @param error_message [String] The raw error message (may contain JSON)
+    # @return [String] The extracted human-readable error message
+    def extract_error_message(error_message)
+      return error_message unless error_message.to_s.include?('{')
+      
+      # Try to extract JSON from the message (it might be prefixed with "Status 400: " etc.)
+      json_match = error_message.to_s.match(/(\{.+\})/m)
+      return error_message unless json_match
+      
+      json_string = json_match[1]
+      
+      begin
+        # Try to parse as JSON
+        json = JSON.parse(json_string)
+        
+        # OpenRouter format: {"error":{"message":"...", "metadata":{"raw":"{...nested JSON...}"}}}
+        if json.is_a?(Hash) && json['error']
+          error_obj = json['error']
+          
+          # Try to get the message from nested raw metadata (Anthropic format)
+          if error_obj['metadata'] && error_obj['metadata']['raw']
+            begin
+              raw_json = JSON.parse(error_obj['metadata']['raw'])
+              # Anthropic format: {"type":"error","error":{"type":"...","message":"..."}}
+              if raw_json['error'] && raw_json['error']['message']
+                return raw_json['error']['message']
+              end
+            rescue JSON::ParserError
+              # raw is not valid JSON, continue
+            end
+          end
+          
+          # Fallback to top-level error message
+          return error_obj['message'] if error_obj['message']
+        end
+        
+        # Direct message field
+        return json['message'] if json['message']
+        
+        # Couldn't extract, return original
+        error_message
+      rescue JSON::ParserError
+        # Not valid JSON, return as-is
+        error_message
+      end
+    end
+    
     # Translate API error messages to user-friendly French messages
     # @param error_message [String] The raw error message from the API
     # @return [String] A user-friendly message in French
     def translate_api_error_for_user(error_message)
+      # First, try to extract the actual message from nested JSON
+      clean_message = extract_error_message(error_message)
+      
       case error_message
       when /after \d+ retries/i
         "⚠️ Le service est temporairement indisponible après plusieurs tentatives. Veuillez réessayer dans quelques instants."
@@ -154,13 +206,13 @@ module LlmToolkit
       when /context.*too long/i, /maximum context length/i, /413/
         "⚠️ La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
       when /invalid.*request/i, /400/
-        "⚠️ Une erreur de format s'est produite: #{error_message.truncate(300)}. Veuillez réessayer ou démarrer une nouvelle conversation."
+        "⚠️ Une erreur de format s'est produite: #{clean_message.truncate(300)}. Veuillez réessayer ou démarrer une nouvelle conversation."
       when /tool.*not.*support/i
         "⚠️ Le modèle sélectionné ne prend pas en charge cette fonctionnalité."
       when /content.*filter/i, /safety/i
         "⚠️ Le contenu a été filtré pour des raisons de sécurité."
       else
-        "⚠️ Une erreur s'est produite: #{error_message.truncate(150)}. Veuillez réessayer."
+        "⚠️ Une erreur s'est produite: #{clean_message.truncate(150)}. Veuillez réessayer."
       end
     end
     

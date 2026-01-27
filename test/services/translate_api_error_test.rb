@@ -225,5 +225,89 @@ module LlmToolkit
       assert_includes result, "erreur de format"
       assert_includes result, "température"
     end
+
+    # ===========================================
+    # Tests for extract_error_message (nested JSON)
+    # ===========================================
+
+    # Helper to call the private extract method
+    def extract_error(message)
+      @service.send(:extract_error_message, message)
+    end
+
+    test "extract_error_message returns plain text as-is" do
+      error = "Simple error message"
+      result = extract_error(error)
+      
+      assert_equal "Simple error message", result
+    end
+
+    test "extract_error_message handles OpenRouter/Anthropic nested JSON format" do
+      # This is the actual format from the logs
+      error = '{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.194.content.2.image.source.base64: image exceeds 5 MB maximum: 5952916 bytes > 5242880 bytes\"},\"request_id\":\"req_011CXYjrizLwjTBYhaWupWoK\"}","provider_name":"Anthropic","is_byok":false}},"user_id":"user_xxx"}'
+      result = extract_error(error)
+      
+      assert_equal "messages.194.content.2.image.source.base64: image exceeds 5 MB maximum: 5952916 bytes > 5242880 bytes", result
+    end
+
+    test "extract_error_message handles simple OpenRouter error format" do
+      error = '{"error":{"message":"Rate limit exceeded","code":429}}'
+      result = extract_error(error)
+      
+      assert_equal "Rate limit exceeded", result
+    end
+
+    test "extract_error_message handles direct message field" do
+      error = '{"message":"Direct error message"}'
+      result = extract_error(error)
+      
+      assert_equal "Direct error message", result
+    end
+
+    test "extract_error_message handles invalid JSON gracefully" do
+      error = '{"broken json'
+      result = extract_error(error)
+      
+      assert_equal '{"broken json', result
+    end
+
+    test "extract_error_message handles JSON without expected structure" do
+      error = '{"something":"else","data":123}'
+      result = extract_error(error)
+      
+      assert_equal '{"something":"else","data":123}', result
+    end
+
+    test "extract_error_message handles nil gracefully" do
+      result = extract_error(nil)
+      
+      assert_nil result
+    end
+
+    test "400 error with nested JSON shows extracted message" do
+      # Full integration test: 400 error with nested JSON should show the clean message
+      error = 'Status 400: {"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"image exceeds 5 MB maximum\"},\"request_id\":\"req_xxx\"}","provider_name":"Anthropic"}}}'
+      result = translate_error(error)
+      
+      assert_includes result, "erreur de format"
+      # The nested message should be extracted, not the raw JSON
+      assert_includes result, "image exceeds 5 MB maximum"
+      # Should NOT contain the JSON structure
+      refute_includes result, "Provider returned error"
+    end
+
+    test "extract_error_message with metadata but no raw field" do
+      error = '{"error":{"message":"Some API error","code":400,"metadata":{"provider_name":"Anthropic"}}}'
+      result = extract_error(error)
+      
+      assert_equal "Some API error", result
+    end
+
+    test "extract_error_message with malformed raw JSON falls back to top-level message" do
+      error = '{"error":{"message":"Fallback message","code":400,"metadata":{"raw":"not valid json at all"}}}'
+      result = extract_error(error)
+      
+      assert_equal "Fallback message", result
+    end
   end
 end
