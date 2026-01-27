@@ -3,7 +3,64 @@ module LlmToolkit
     module OpenrouterHandler
       extend ActiveSupport::Concern
       
+      # Safety margin to leave room for model overhead (tool definitions, etc.)
+      CONTEXT_SAFETY_MARGIN = 10_000
+      
       private
+      
+      # Calculate appropriate max_tokens based on model type and context usage
+      # 
+      # OpenAI models: Need explicit max_tokens, calculated based on remaining context
+      # Anthropic models: Handle max_tokens automatically, we don't specify it
+      # Other models: Use default behavior
+      #
+      # @param llm_model [LlmToolkit::LlmModel] The model being used
+      # @param messages [Array] The formatted messages (to estimate token count)
+      # @return [Integer, nil] max_tokens value, or nil to let the model decide
+      def calculate_max_tokens_for_model(llm_model, messages)
+        model_id = llm_model.model_id.to_s.downcase
+        
+        # Anthropic models handle max_tokens automatically - don't specify it
+        # This allows them to use the full remaining context
+        if model_id.start_with?('anthropic/')
+          Rails.logger.info("Anthropic model detected - letting model manage max_tokens automatically")
+          return nil
+        end
+        
+        # For OpenAI and other models, we need to specify max_tokens
+        # Calculate based on remaining context space
+        
+        # Get configured limits
+        output_limit = llm_model.output_token_limit.to_i
+        output_limit = LlmToolkit.config.default_max_tokens if output_limit <= 0
+        
+        context_limit = llm_model.input_token_limit.to_i
+        
+        # If we don't know the context limit, just use the output limit
+        if context_limit <= 0
+          Rails.logger.info("No context limit known - using output limit: #{output_limit}")
+          return output_limit
+        end
+        
+        # Estimate current prompt size (rough: 4 chars ≈ 1 token)
+        prompt_chars = messages.to_json.length
+        estimated_prompt_tokens = (prompt_chars / 4.0).ceil
+        
+        # Calculate remaining space for output
+        remaining_tokens = context_limit - estimated_prompt_tokens - CONTEXT_SAFETY_MARGIN
+        
+        # Use the smaller of: output limit or remaining space
+        calculated_max = [output_limit, remaining_tokens].min
+        
+        # Ensure we have at least some tokens for output (minimum 1000)
+        final_max = [calculated_max, 1000].max
+        
+        if remaining_tokens < output_limit
+          Rails.logger.info("Context constraint: #{estimated_prompt_tokens} prompt tokens, #{remaining_tokens} remaining, capped to #{final_max}")
+        end
+        
+        final_max
+      end
       
       def call_openrouter(llm_model, system_messages, conversation_history, tools = nil)
         client = Faraday.new(url: 'https://openrouter.ai/api/v1') do |f|
@@ -19,25 +76,21 @@ module LlmToolkit
         messages = formatted_system_messages + fixed_conversation_history
 
         model_name = llm_model.model_id.presence || llm_model.name
-        # Determine max_tokens: use model's output_token_limit (if positive), settings override, or default
-        # We use > 0 check because 0 or nil should fall back to other options
-        max_tokens = if llm_model.output_token_limit.to_i > 0
-                       llm_model.output_token_limit
-                     elsif settings&.dig('max_tokens').to_i > 0
-                       settings.dig('max_tokens').to_i
-                     else
-                       LlmToolkit.config.default_max_tokens
-                     end
         Rails.logger.info("Using model: #{model_name}")
-        Rails.logger.info("Max output tokens: #{max_tokens}")
+        
+        # Determine max_tokens based on model type
+        max_tokens = calculate_max_tokens_for_model(llm_model, messages)
+        Rails.logger.info("Max output tokens: #{max_tokens || 'not specified (model default)'}")
 
         request_body = {
           model: model_name,
           messages: messages,
           stream: false,
-          max_tokens: max_tokens,
           usage: { include: true }
         }
+        
+        # Only include max_tokens if we have a value (some models handle it automatically)
+        request_body[:max_tokens] = max_tokens if max_tokens
 
         tools = Array(tools)
         if tools.present?
@@ -122,24 +175,19 @@ module LlmToolkit
         model_name = llm_model.model_id.presence || llm_model.name
         Rails.logger.info("Using model: #{model_name}")
         
-        # Determine max_tokens: use model's output_token_limit (if positive), settings override, or default
-        # We use > 0 check because 0 or nil should fall back to other options
-        max_tokens = if llm_model.output_token_limit.to_i > 0
-                       llm_model.output_token_limit
-                     elsif settings&.dig('max_tokens').to_i > 0
-                       settings.dig('max_tokens').to_i
-                     else
-                       LlmToolkit.config.default_max_tokens
-                     end
-        Rails.logger.info("Max output tokens: #{max_tokens}")
+        # Determine max_tokens based on model type
+        max_tokens = calculate_max_tokens_for_model(llm_model, messages)
+        Rails.logger.info("Max output tokens: #{max_tokens || 'not specified (model default)'}")
 
         request_body = {
           model: model_name,
           messages: messages,
           stream: true,
-          max_tokens: max_tokens,
           usage: { include: true }
         }
+        
+        # Only include max_tokens if we have a value (some models handle it automatically)
+        request_body[:max_tokens] = max_tokens if max_tokens
 
         tools = Array(tools)
         if tools.present?
