@@ -154,7 +154,7 @@ module LlmToolkit
       when /context.*too long/i, /maximum context length/i, /413/
         "⚠️ La conversation est devenue trop longue. Veuillez démarrer une nouvelle conversation."
       when /invalid.*request/i, /400/
-        "⚠️ Une erreur de format s'est produite. Veuillez réessayer ou démarrer une nouvelle conversation."
+        "⚠️ Une erreur de format s'est produite: #{error_message.truncate(300)}. Veuillez réessayer ou démarrer une nouvelle conversation."
       when /tool.*not.*support/i
         "⚠️ Le modèle sélectionné ne prend pas en charge cette fonctionnalité."
       when /content.*filter/i, /safety/i
@@ -670,7 +670,7 @@ module LlmToolkit
         when /Status 413/i
           "La conversation est devenue trop longue. Veuillez commencer une nouvelle conversation."
         when /Status 400/i
-          "Une erreur de format s'est produite. Veuillez réessayer."
+          "Une erreur de format s'est produite: #{e.message.truncate(300)}. Veuillez réessayer."
         when /Status 429/i, /rate limit/i
           "Le service est temporairement surchargé. Veuillez réessayer dans quelques instants."
         when /timeout/i
