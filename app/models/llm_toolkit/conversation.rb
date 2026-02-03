@@ -406,6 +406,9 @@ module LlmToolkit
 
       assistant_tool_call_message = nil
       tool_result_messages = []
+      # Collect image messages separately to add AFTER all tool results
+      # This ensures the tool_result sequence is not broken by user messages
+      image_messages = []
 
       tool_uses.each do |tool_use|
         tool_id = tool_use.tool_use_id.presence || "tool_#{SecureRandom.hex(4)}_#{tool_use.name}"
@@ -474,9 +477,11 @@ module LlmToolkit
             content: tool_result_content
           }
           
+          # Collect image messages separately - they must go AFTER all tool results
+          # to avoid breaking the tool_call -> tool_result sequence required by the API
           if image_data
             Rails.logger.info("📸 Adding screenshot image to conversation for tool #{tool_use.name}")
-            tool_result_messages << create_image_user_message(image_data, tool_use.name)
+            image_messages << create_image_user_message(image_data, tool_use.name)
           end
         else
           Rails.logger.warn("Tool use #{tool_use.id} (#{tool_use.name}) has no tool_result - creating synthetic error response for OpenRouter")
@@ -501,6 +506,8 @@ module LlmToolkit
       
       messages << assistant_tool_call_message if assistant_tool_call_message
       messages += tool_result_messages
+      # Add image messages AFTER all tool results to maintain valid sequence
+      messages += image_messages
       
       Rails.logger.debug("Formatted OpenRouter messages: #{messages.inspect}")
       
