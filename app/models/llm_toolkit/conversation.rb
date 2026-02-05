@@ -177,14 +177,25 @@ module LlmToolkit
     end
 
     # Returns an array of messages formatted for LLM providers
-    def history(llm_model: nil)
+    def history(llm_model: nil, exclude_message_id: nil)
       target_llm_model = llm_model || get_default_llm_model
       provider_type = target_llm_model.llm_provider.provider_type
       raise ArgumentError, "Invalid provider type derived from model" unless ["anthropic", "openrouter"].include?(provider_type)
 
       history_messages = []
 
-      messages.non_error.order(:created_at).each do |message|
+      # Build the base query
+      base_messages = messages.non_error.order(:created_at)
+      
+      # Exclude specific message if requested (e.g., the current assistant message being populated)
+      base_messages = base_messages.where.not(id: exclude_message_id) if exclude_message_id.present?
+
+      base_messages.each do |message|
+        # Skip assistant messages that only contain placeholder content AND have no tool calls
+        # These are "thinking..." messages that shouldn't be sent to the LLM
+        # This is especially important for models like Claude Opus 4 that don't support prefill
+        # BUT: assistant messages with tool_uses are valid even if content is empty!
+        next if message.llm_content? && message.placeholder_content? && message.tool_uses.empty?
         llm_message = { role: message.role }
         tool_uses = message.tool_uses
 

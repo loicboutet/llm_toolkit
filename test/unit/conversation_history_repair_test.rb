@@ -326,7 +326,91 @@ class ConversationImageMessageOrderingTest < ActiveSupport::TestCase
     end
   end
 
+  test "placeholder assistant messages should be excluded from history" do
+    conversation = create_conversation_with_placeholder_message
+    
+    history = conversation.history(llm_model: @llm_model)
+    
+    # The placeholder message should NOT be in the history
+    placeholder_messages = history.select do |msg|
+      msg[:role] == 'assistant' && 
+      LlmToolkit::Message::PLACEHOLDER_MARKERS.any? { |marker| msg[:content]&.strip == marker }
+    end
+    
+    assert_empty placeholder_messages, 
+      "Placeholder assistant messages should be excluded from history"
+    
+    # History should end with user message, not assistant placeholder
+    assert_equal 'user', history.last[:role],
+      "History should end with user message (not placeholder assistant)"
+  end
+
+  test "exclude_message_id parameter should exclude specific message" do
+    conversation = create_conversation_with_real_assistant_message
+    
+    # Get the assistant message ID
+    assistant_message = conversation.messages.find_by(role: 'assistant')
+    
+    # Get history without exclusion
+    history_with_assistant = conversation.history(llm_model: @llm_model)
+    assert history_with_assistant.any? { |m| m[:role] == 'assistant' },
+      "History should contain assistant message"
+    
+    # Get history with exclusion
+    history_without_assistant = conversation.history(
+      llm_model: @llm_model, 
+      exclude_message_id: assistant_message.id
+    )
+    
+    # The excluded message should not appear
+    # Note: we can't easily check by content since we may have other assistant messages
+    # Just verify the count is reduced
+    assistant_count_with = history_with_assistant.count { |m| m[:role] == 'assistant' }
+    assistant_count_without = history_without_assistant.count { |m| m[:role] == 'assistant' }
+    
+    assert_equal assistant_count_with - 1, assistant_count_without,
+      "Excluding a message should reduce the count by 1"
+  end
+
   private
+  
+  def create_conversation_with_placeholder_message
+    conversation = LlmToolkit::Conversation.create!(
+      conversable: @user,
+      agent_type: :coder,
+      status: :working
+    )
+
+    # User message
+    conversation.messages.create!(role: 'user', content: 'Hello')
+
+    # Placeholder assistant message (like what happens during streaming)
+    conversation.messages.create!(
+      role: 'assistant',
+      content: '🤔 Traitement de votre demande...'
+    )
+
+    conversation
+  end
+  
+  def create_conversation_with_real_assistant_message
+    conversation = LlmToolkit::Conversation.create!(
+      conversable: @user,
+      agent_type: :coder,
+      status: :resting
+    )
+
+    # User message
+    conversation.messages.create!(role: 'user', content: 'Hello')
+
+    # Real assistant message
+    conversation.messages.create!(
+      role: 'assistant',
+      content: 'Hello! How can I help you today?'
+    )
+
+    conversation
+  end
 
   def create_conversation_with_screenshot_and_other_tool
     conversation = LlmToolkit::Conversation.create!(
