@@ -181,16 +181,6 @@ module LlmToolkit
       target_llm_model = llm_model || get_default_llm_model
       provider_type = target_llm_model.llm_provider.provider_type
       raise ArgumentError, "Invalid provider type derived from model" unless ["anthropic", "openrouter"].include?(provider_type)
-      
-      # Determine the message format to use
-      # For OpenRouter with Anthropic models, use Anthropic native format to avoid conversion issues
-      model_id = target_llm_model.model_id.to_s.downcase
-      message_format = if provider_type == "openrouter" && model_id.start_with?('anthropic/')
-                         Rails.logger.info("[HISTORY] Using Anthropic native format for OpenRouter model: #{model_id}")
-                         "anthropic"
-                       else
-                         provider_type
-                       end
 
       history_messages = []
 
@@ -249,7 +239,7 @@ module LlmToolkit
         end
 
         if tool_uses.any?
-          case message_format
+          case provider_type
           when "anthropic"
             history_messages += format_anthropic_message(llm_message, tool_uses)
           when "openrouter"
@@ -263,9 +253,9 @@ module LlmToolkit
                 llm_message[:content] = text_part ? text_part[:text] : ""
               end
             elsif llm_message[:role] == 'user'
-              if message_format == 'openrouter' && llm_message[:content].is_a?(String)
+              if provider_type == 'openrouter' && llm_message[:content].is_a?(String)
                 llm_message[:content] = [{ type: "text", text: llm_message[:content] }]
-              elsif message_format == 'anthropic' && llm_message[:content].is_a?(Array)
+              elsif provider_type == 'anthropic' && llm_message[:content].is_a?(Array)
                 text_part = llm_message[:content].find { |part| part[:type] == 'text' }
                 llm_message[:content] = text_part ? text_part[:text] : ""
               end
@@ -275,8 +265,6 @@ module LlmToolkit
         end
       end
 
-      # Note: cache_control is handled by the provider handler, not here
-      # For native Anthropic provider, add cache control
       if provider_type == "anthropic"
         add_cache_control(history_messages)
       end
@@ -286,7 +274,7 @@ module LlmToolkit
         next false if msg[:role] == 'tool'
         
         is_empty_non_user = msg[:role] != 'user' && msg[:content].blank? && msg[:tool_calls].blank?
-        is_empty_user = if message_format == "anthropic"
+        is_empty_user = if provider_type == "anthropic"
                           msg[:role] == 'user' && msg[:content].blank?
                         else
                           msg[:role] == 'user' && msg[:content].is_a?(Array) && msg[:content].all? { |p| p[:type] == 'text' && p[:text].blank? }
@@ -295,9 +283,7 @@ module LlmToolkit
       end
       
       # Repair invalid sequences: tool -> user must have an assistant message in between
-      # Note: This only applies to OpenRouter format (which has role: "tool" messages)
-      # Anthropic format has tool_results inside user messages, so no repair needed
-      repair_tool_user_sequences(filtered_messages, message_format)
+      repair_tool_user_sequences(filtered_messages, provider_type)
     end
 
     private
