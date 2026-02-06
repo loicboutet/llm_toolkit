@@ -168,12 +168,12 @@ module LlmToolkit
       RETRYABLE_STATUS_CODES = [500, 502, 503, 504, 520, 521, 522, 523, 524, 529].freeze
       
       def stream_openrouter(llm_model, system_messages, conversation_history, tools = nil, &block)
+        formatted_system_messages = format_system_messages_for_openrouter(system_messages)
+        fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history)
+        messages = formatted_system_messages + fixed_conversation_history
+
         model_name = llm_model.model_id.presence || llm_model.name
         Rails.logger.info("Using model: #{model_name}")
-        
-        formatted_system_messages = format_system_messages_for_openrouter(system_messages)
-        fixed_conversation_history = fix_conversation_history_for_openrouter(conversation_history, model_name: model_name)
-        messages = formatted_system_messages + fixed_conversation_history
         
         # Determine max_tokens based on model type
         max_tokens = calculate_max_tokens_for_model(llm_model, messages)
@@ -510,7 +510,7 @@ module LlmToolkit
       # 3. Last non-tool message with content (fallback for non-tool conversations)
       #
       # This ensures tool results get cached efficiently.
-      def fix_conversation_history_for_openrouter(conversation_history, model_name: nil)
+      def fix_conversation_history_for_openrouter(conversation_history)
         messages = Array(conversation_history)
         return [] if messages.empty?
         
@@ -520,12 +520,7 @@ module LlmToolkit
         Rails.logger.info("[CONVERSATION CACHE] Strategy: first_user + last_tool_or_content")
         Rails.logger.info("[CONVERSATION CACHE] Cache breakpoints at indices: #{cache_indices.inspect}")
         
-        # Check if model requires special handling for trailing tool messages
-        # Claude Opus 4.6 (and potentially other newer models) don't accept
-        # conversations that end with tool messages during followup calls
-        needs_trailing_tool_fix = model_requires_trailing_tool_fix?(model_name)
-        
-        result = messages.each_with_index.map do |msg, index|
+        messages.each_with_index.map do |msg, index|
           fixed_msg = msg.dup
           is_tool_message = (msg[:role] == 'tool')
           should_cache = cache_indices.include?(index) && conversation_caching_enabled?
@@ -571,74 +566,6 @@ module LlmToolkit
           end
           
           fixed_msg
-        end
-        
-        # Workaround for Claude Opus 4.6 bug: PDF + tool results causes
-        # "tool_result.tool_use_id: Field required" error
-        # If history has tool messages AND model has this bug, strip PDF files
-        has_tool_messages = result.any? { |msg| msg[:role] == 'tool' }
-        if has_tool_messages && model_has_pdf_tool_result_bug?(model_name)
-          result = strip_pdf_files_from_history(result)
-        end
-        
-        result
-      end
-      
-      # Check if the model requires special handling when conversation ends with tool messages
-      # This is needed for models like Claude Opus 4.6 that have stricter message format requirements
-      def model_requires_trailing_tool_fix?(model_name)
-        return false if model_name.blank?
-        
-        # Models known to have issues with trailing tool messages
-        problematic_models = [
-          'anthropic/claude-opus-4.6',
-          # Add other models here as we discover them
-        ]
-        
-        problematic_models.any? { |m| model_name.include?(m) || model_name == m }
-      end
-      
-      # Check if model has issues with PDF files in conversation history
-      # combined with tool results. This is a known bug with Opus 4.6 via OpenRouter.
-      # Bug: When history contains PDF + tool results, Opus 4.6 returns:
-      # "messages.X.content.Y.tool_result.tool_use_id: Field required"
-      def model_has_pdf_tool_result_bug?(model_name)
-        return false if model_name.blank?
-        
-        problematic_models = [
-          'anthropic/claude-opus-4.6',
-          # Add other models here as we discover them
-        ]
-        
-        problematic_models.any? { |m| model_name.include?(m) || model_name == m }
-      end
-      
-      # Remove PDF file attachments from conversation history
-      # This is a workaround for models that have bugs with PDF + tool results
-      def strip_pdf_files_from_history(messages)
-        messages.map do |msg|
-          next msg unless msg[:content].is_a?(Array)
-          
-          # Check if message has any file parts
-          has_files = msg[:content].any? { |part| part[:type] == 'file' }
-          next msg unless has_files
-          
-          # Filter out file parts, keep everything else
-          filtered_content = msg[:content].reject { |part| part[:type] == 'file' }
-          
-          # If we removed files, add a note about it
-          if filtered_content.length < msg[:content].length
-            removed_count = msg[:content].length - filtered_content.length
-            Rails.logger.warn("[PDF WORKAROUND] Removed #{removed_count} file attachment(s) from message for model compatibility")
-            
-            # Add a note about the removed file(s)
-            filtered_content << {
-              type: 'text',
-              text: "[Note: #{removed_count} file attachment(s) were provided earlier but removed from this followup for model compatibility]"
-            }
-          end
-          
-          msg.merge(content: filtered_content)
         end
       end
       

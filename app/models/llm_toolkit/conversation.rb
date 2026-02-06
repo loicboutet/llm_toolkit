@@ -288,32 +288,21 @@ module LlmToolkit
 
     private
 
-    # Repairs invalid message sequences for LLM APIs. This handles two cases:
-    #
-    # CASE 1: tool -> user (without assistant in between)
-    # This can happen when:
+    # Repairs invalid message sequences where a tool result is followed directly by a user message
+    # without an assistant response in between. This can happen when:
     # 1. An error occurs during the followup call after a tool execution
     # 2. The error message is saved with is_error: true (and thus excluded from history)
     # 3. The user sends a new message
     # Result: tool -> user (invalid for OpenAI/OpenRouter API which expects tool -> assistant -> user)
     #
-    # CASE 2: History ends with tool messages (for followup calls)
-    # This happens during the followup after tool execution:
-    # 1. Assistant calls tools
-    # 2. Tools are executed, tool results are saved
-    # 3. Followup is triggered to get assistant's response to tool results
-    # 4. History ends with: assistant (tool_calls) -> tool -> tool -> ...
-    # Some models (notably Claude Opus 4.6 via OpenRouter) require the history to NOT
-    # end with tool messages when making a followup call.
-    #
-    # This method injects synthetic assistant messages to make sequences valid.
+    # This method injects a synthetic assistant message to make the sequence valid.
     def repair_tool_user_sequences(messages, provider_type)
       return messages if messages.empty?
       
       repaired = []
       
       messages.each_with_index do |msg, i|
-        # CASE 1: Check if we need to inject a synthetic assistant message before a user message
+        # Check if we need to inject a synthetic assistant message
         if i > 0 && msg[:role] == 'user'
           prev_msg = repaired.last
           
@@ -329,12 +318,6 @@ module LlmToolkit
         
         repaired << msg
       end
-      
-      # CASE 2: If history ends with tool message(s), we need to NOT add anything here
-      # because the LLM will respond to the tool results.
-      # However, some models (Claude Opus 4.6) have issues when the history ends with tool.
-      # The real fix for this is handled at the provider level in fix_conversation_history_for_openrouter
-      # which detects Opus 4.6 and handles it appropriately.
       
       repaired
     end
