@@ -7,5 +7,16 @@ module LlmToolkit
 
     # Scopes
     scope :ordered, -> { order(position: :asc, id: :asc) }
+
+    # settings is a jsonb column that holds per-model feature flags.
+    # Supported keys:
+    #   'code_execution' (Boolean) — enable Anthropic's Code Execution native tool
+    #
+    # Example:
+    #   model.update!(settings: { 'code_execution' => true })
+    #   model.code_execution_enabled?  # => true
+    def code_execution_enabled?
+      settings&.dig('code_execution') == true
+    end
   end
 end

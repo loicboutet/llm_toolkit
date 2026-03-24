@@ -18,6 +18,9 @@ module LlmToolkit
         tools = Array(tools)
         all_tools = tools.presence || LlmToolkit::ToolService.tool_definitions
         
+        # Add native tools (e.g. code_execution) if enabled on the model
+        all_tools = build_tools_with_native(all_tools, llm_model)
+        
         Rails.logger.info("Anthropic - Tools count: #{all_tools.size}")
 
         model_name = llm_model.model_id.presence || llm_model.name
@@ -53,7 +56,7 @@ module LlmToolkit
           req.headers['Content-Type'] = 'application/json'
           req.headers['x-api-key'] = api_key
           req.headers['anthropic-version'] = '2023-06-01'
-          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31,files-api-2025-04-14'
+          req.headers['anthropic-beta'] = build_anthropic_beta_header(llm_model)
           req.body = request_body.to_json
         end
 
@@ -98,6 +101,9 @@ module LlmToolkit
 
         tools = Array(tools)
         all_tools = tools.presence || LlmToolkit::ToolService.tool_definitions
+        
+        # Add native tools (e.g. code_execution) if enabled on the model
+        all_tools = build_tools_with_native(all_tools, llm_model)
         
         model_name = llm_model.model_id.presence || llm_model.name
         max_tokens = settings&.dig('max_tokens')&.to_i.presence || LlmToolkit.config.default_max_tokens
@@ -145,7 +151,7 @@ module LlmToolkit
           req.headers['Content-Type'] = 'application/json'
           req.headers['x-api-key'] = api_key
           req.headers['anthropic-version'] = '2023-06-01'
-          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31,files-api-2025-04-14'
+          req.headers['anthropic-beta'] = build_anthropic_beta_header(llm_model)
           req.body = request_body.to_json
           req.options.on_data = proc do |chunk, size, env|
             handle_anthropic_streaming_chunk(chunk, streaming_state, &block)
@@ -450,12 +456,20 @@ module LlmToolkit
           content_block = json_data['content_block'] || {}
           
           if content_block['type'] == 'tool_use'
-            # Start of a tool use block
+            # Start of a tool use block (includes code_execution calls)
             streaming_state[:current_tool_use] = {
               'type' => 'tool_use',
               'id' => content_block['id'],
               'name' => content_block['name'],
               'input' => {}
+            }
+            streaming_state[:tool_input_json] = ""
+          elsif content_block['type'] == 'bash_code_execution_tool_result'
+            # Native code execution result block — will be assembled via content_block_delta
+            streaming_state[:current_tool_use] = {
+              'type' => 'bash_code_execution_tool_result',
+              'tool_use_id' => content_block['tool_use_id'],
+              'content' => []
             }
             streaming_state[:tool_input_json] = ""
           end
@@ -475,20 +489,37 @@ module LlmToolkit
           end
           
         when 'content_block_stop'
-          # If we were building a tool use, finalize it
+          # If we were building a tool use or code execution result, finalize it
           if streaming_state[:current_tool_use]
-            # Parse the accumulated JSON input
-            if streaming_state[:tool_input_json].present?
-              begin
-                streaming_state[:current_tool_use]['input'] = JSON.parse(streaming_state[:tool_input_json])
-              rescue JSON::ParserError => e
-                Rails.logger.error("Failed to parse tool input JSON: #{e.message}")
-                streaming_state[:current_tool_use]['input'] = {}
-              end
-            end
+            current_type = streaming_state[:current_tool_use]['type']
             
-            streaming_state[:tool_calls] << streaming_state[:current_tool_use]
-            yield({ chunk_type: 'tool_call_update', tool_calls: streaming_state[:tool_calls] }) if block_given?
+            if current_type == 'tool_use'
+              # Parse the accumulated JSON input for regular tool calls (incl. code_execution)
+              if streaming_state[:tool_input_json].present?
+                begin
+                  streaming_state[:current_tool_use]['input'] = JSON.parse(streaming_state[:tool_input_json])
+                rescue JSON::ParserError => e
+                  Rails.logger.error("Failed to parse tool input JSON: #{e.message}")
+                  streaming_state[:current_tool_use]['input'] = {}
+                end
+              end
+              
+              streaming_state[:tool_calls] << streaming_state[:current_tool_use]
+              yield({ chunk_type: 'tool_call_update', tool_calls: streaming_state[:tool_calls] }) if block_given?
+            elsif current_type == 'bash_code_execution_tool_result'
+              # Parse the accumulated JSON for the code execution result content
+              if streaming_state[:tool_input_json].present?
+                begin
+                  result_content = JSON.parse(streaming_state[:tool_input_json])
+                  streaming_state[:current_tool_use]['content'] = Array(result_content)
+                rescue JSON::ParserError => e
+                  Rails.logger.error("Failed to parse code execution result JSON: #{e.message}")
+                end
+              end
+              
+              streaming_state[:tool_calls] << streaming_state[:current_tool_use]
+              yield({ chunk_type: 'tool_call_update', tool_calls: streaming_state[:tool_calls] }) if block_given?
+            end
             
             streaming_state[:current_tool_use] = nil
             streaming_state[:tool_input_json] = nil
@@ -534,6 +565,43 @@ module LlmToolkit
         end
       end
       
+      # =========================================================================
+      # Code Execution & Native Tools Support
+      # =========================================================================
+
+      # Check whether the given llm_model has code_execution enabled.
+      # Delegates to LlmModel#code_execution_enabled? if available,
+      # otherwise falls back to reading the settings hash directly.
+      def code_execution_enabled?(llm_model)
+        return false unless llm_model
+        if llm_model.respond_to?(:code_execution_enabled?)
+          llm_model.code_execution_enabled?
+        else
+          llm_model.settings&.dig('code_execution') == true
+        end
+      end
+
+      # Build the anthropic-beta header string, adding code-execution if needed
+      def build_anthropic_beta_header(llm_model)
+        base = 'prompt-caching-2024-07-31,files-api-2025-04-14'
+        if code_execution_enabled?(llm_model)
+          "#{base},code-execution-2025-08-25"
+        else
+          base
+        end
+      end
+
+      # Merge native Anthropic tools (e.g. code_execution) into the tools list.
+      # Native tools only carry :type and :name — no :description or :input_schema.
+      def build_tools_with_native(tools, llm_model)
+        return tools unless code_execution_enabled?(llm_model)
+
+        native_tool = { type: 'code_execution_20250522', name: 'code_execution' }
+
+        # Prepend so native tools come first (Anthropic convention)
+        [native_tool] + Array(tools)
+      end
+
       def translate_anthropic_error(error_message)
         case error_message
         when /rate limit/i, /too many requests/i

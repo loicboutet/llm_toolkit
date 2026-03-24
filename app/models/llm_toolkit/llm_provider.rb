@@ -97,6 +97,10 @@ module LlmToolkit
 
     def validate_tools_format(tools)
       tools.each do |tool|
+        # Skip native Anthropic tools — they only have :type and :name,
+        # no :description or :input_schema.
+        next if anthropic_native_tool?(tool)
+
         unless tool.is_a?(Hash) && tool[:name].present? && tool[:description].present?
           Rails.logger.warn "Invalid tool format detected: #{tool.inspect}"
           
@@ -109,18 +113,49 @@ module LlmToolkit
       end
     end
 
-    # Standardize the Anthropic API response to our internal format
+    # Returns true if the tool is a native Anthropic tool (identified by its :type field)
+    # Native tools: code_execution_20250522, computer_20251022, text_editor_20250124, etc.
+    ANTHROPIC_NATIVE_TOOL_PATTERN = /\A(code_execution|computer|text_editor|bash)_\d/
+
+    def anthropic_native_tool?(tool)
+      return false unless tool.is_a?(Hash)
+      tool_type = tool[:type] || tool['type']
+      tool_type.present? && ANTHROPIC_NATIVE_TOOL_PATTERN.match?(tool_type.to_s)
+    end
+
+    # Standardize the Anthropic API response to our internal format.
+    # Handles:
+    #   - Regular text blocks
+    #   - tool_use blocks (custom tools AND native code_execution calls)
+    #   - bash_code_execution_tool_result blocks (native code execution results)
     def standardize_response(response)
-      content = response.dig('content', 0, 'text')
-      tool_calls = response['content'].select { |c| c['type'] == 'tool_use' } if response['content'].is_a?(Array)
-      
+      content_blocks = response['content']
+
+      # Extract plain text from the first text block
+      content = nil
+      if content_blocks.is_a?(Array)
+        text_block = content_blocks.find { |c| c['type'] == 'text' }
+        content = text_block&.dig('text')
+      end
+
+      # Collect all tool_use blocks (includes code_execution invocations)
+      tool_calls = []
+      if content_blocks.is_a?(Array)
+        tool_calls = content_blocks.select { |c| c['type'] == 'tool_use' }
+
+        # Also include bash_code_execution_tool_result blocks so callers can
+        # inspect execution results without a second round-trip.
+        code_execution_results = content_blocks.select { |c| c['type'] == 'bash_code_execution_tool_result' }
+        tool_calls += code_execution_results if code_execution_results.any?
+      end
+
       {
         'content' => content || "",
         'model' => response['model'],
         'role' => response['role'],
         'stop_reason' => response['stop_reason'],
         'stop_sequence' => response['stop_sequence'],
-        'tool_calls' => tool_calls || [],
+        'tool_calls' => tool_calls,
         'usage' => response['usage'],
         'finish_reason' => response['stop_reason']
       }
