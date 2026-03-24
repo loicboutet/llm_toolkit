@@ -19,7 +19,7 @@ module LlmToolkit
 
     # Real Anthropic API key – pulled from ENV first, then hard-coded fallback
     # for local development.
-    ANTHROPIC_API_KEY = ENV.fetch("ANTHROPIC_API_KEY", "REDACTED")
+    ANTHROPIC_API_KEY = ENV.fetch("ANTHROPIC_API_KEY", nil)
 
     # Model that supports code execution (claude-3-5 family or claude-4)
     TEST_MODEL_ID = "claude-sonnet-4-5-20250929"
