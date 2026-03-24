@@ -190,14 +190,12 @@ module LlmToolkit
       # Exclude specific message if requested (e.g., the current assistant message being populated)
       base_messages = base_messages.where.not(id: exclude_message_id) if exclude_message_id.present?
 
-      # Find the ID of the last user message with attachments so we only inline
-      # file content for that message. For earlier messages, we reference the
-      # filename as text to avoid re-sending large base64 payloads every turn.
-      last_user_msg_with_attachments_id = base_messages
-        .where(role: 'user')
-        .joins(:attachments_attachments)
-        .order(:created_at)
-        .last&.id
+      # For Anthropic provider: pre-build the file upload service once per history() call.
+      # Files are uploaded once and cached via blob.anthropic_file_id so subsequent turns
+      # reference the same file_id without re-uploading.
+      anthropic_file_service = if provider_type == 'anthropic'
+        LlmToolkit::AnthropicFileUploadService.new(target_llm_model.llm_provider)
+      end
 
       base_messages.each do |message|
         # Skip assistant messages that only contain placeholder content AND have no tool calls
@@ -212,39 +210,39 @@ module LlmToolkit
           content_parts = []
           content_parts << { type: "text", text: message.content.presence || "" }
 
-          if message.attachments.attached? && provider_type == 'openrouter'
-            is_latest_attachment_message = (message.id == last_user_msg_with_attachments_id)
-
+          if message.attachments.attached?
             message.attachments.each do |attachment|
               begin
-                if is_latest_attachment_message
-                  # Latest message with attachments: send the full inline base64 content
-                  blob_data = attachment.blob.download
-                  base64_data = Base64.strict_encode64(blob_data)
+                if provider_type == 'anthropic'
+                  # Anthropic Files API: upload once, reference by file_id in every turn.
+                  # This avoids re-encoding large binaries and lets the model truly
+                  # re-read the file whenever needed (agentique use-cases included).
+                  file_id = anthropic_file_service&.upload_or_get_file_id(attachment)
 
-                  if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
-                    data_url = "data:#{attachment.content_type};base64,#{base64_data}"
-                    content_parts << { type: "image_url", image_url: { url: data_url } }
-                  elsif attachment.content_type == 'application/pdf'
-                    data_url = "data:application/pdf;base64,#{base64_data}"
-                    content_parts << {
-                      type: "file",
-                      file: {
-                        filename: attachment.filename.to_s,
-                        file_data: data_url
+                  if file_id
+                    if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
+                      content_parts << {
+                        type: "image",
+                        source: { type: "file", file_id: file_id }
                       }
-                    }
+                    elsif attachment.content_type == 'application/pdf'
+                      content_parts << {
+                        type: "document",
+                        source: { type: "file", file_id: file_id }
+                      }
+                    else
+                      Rails.logger.warn "Unsupported attachment type for Anthropic Files API: #{attachment.content_type}, filename: #{attachment.filename}"
+                    end
                   else
-                    Rails.logger.warn "Unsupported attachment type for LLM: #{attachment.content_type}, filename: #{attachment.filename}"
+                    # Fallback to base64 inline if upload failed
+                    Rails.logger.warn "[AnthropicFileUpload] Falling back to base64 for #{attachment.filename}"
+                    content_parts.concat(encode_attachment_as_base64_anthropic(attachment))
                   end
-                else
-                  # Historical messages: reference filename as text only.
-                  # OpenRouter does not support a persistent file_id API, so re-sending
-                  # large base64 payloads for every historical message would bloat every
-                  # subsequent request. The model has already processed the file content
-                  # in earlier turns and retains that understanding in the conversation.
-                  Rails.logger.info "Skipping inline file content for historical message #{message.id} (#{attachment.filename})"
-                  content_parts << { type: "text", text: "[Fichier joint précédemment: #{attachment.filename}]" }
+
+                elsif provider_type == 'openrouter'
+                  # OpenRouter has no persistent Files API — send full base64 inline every turn.
+                  # The model re-reads the file each time which is correct for agentique use-cases.
+                  content_parts.concat(encode_attachment_as_base64_openrouter(attachment))
                 end
               rescue => e
                 Rails.logger.error "Error processing attachment #{attachment.id} for LLM: #{e.message}"
@@ -663,6 +661,46 @@ module LlmToolkit
     end
 
     # Check if content looks like actual PDF base64 data (not source code)
+    # Encode an attachment as base64 inline for the Anthropic direct API (non-Files API fallback)
+    def encode_attachment_as_base64_anthropic(attachment)
+      parts = []
+      blob_data   = attachment.blob.download
+      base64_data = Base64.strict_encode64(blob_data)
+
+      if attachment.image? && ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].include?(attachment.content_type)
+        parts << {
+          type: "image",
+          source: { type: "base64", media_type: attachment.content_type, data: base64_data }
+        }
+      elsif attachment.content_type == 'application/pdf'
+        parts << {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: base64_data }
+        }
+      else
+        Rails.logger.warn "Unsupported attachment type for Anthropic base64 fallback: #{attachment.content_type}"
+      end
+      parts
+    end
+
+    # Encode an attachment as base64 inline for OpenRouter (no persistent Files API)
+    def encode_attachment_as_base64_openrouter(attachment)
+      parts = []
+      blob_data   = attachment.blob.download
+      base64_data = Base64.strict_encode64(blob_data)
+
+      if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
+        data_url = "data:#{attachment.content_type};base64,#{base64_data}"
+        parts << { type: "image_url", image_url: { url: data_url } }
+      elsif attachment.content_type == 'application/pdf'
+        data_url = "data:application/pdf;base64,#{base64_data}"
+        parts << { type: "file", file: { filename: attachment.filename.to_s, file_data: data_url } }
+      else
+        Rails.logger.warn "Unsupported attachment type for OpenRouter: #{attachment.content_type}, filename: #{attachment.filename}"
+      end
+      parts
+    end
+
     def looks_like_actual_pdf_data?(content_str)
       return false unless content_str.include?('data:application/pdf;base64')
 

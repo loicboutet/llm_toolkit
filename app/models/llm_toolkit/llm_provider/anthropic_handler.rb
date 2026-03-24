@@ -53,7 +53,7 @@ module LlmToolkit
           req.headers['Content-Type'] = 'application/json'
           req.headers['x-api-key'] = api_key
           req.headers['anthropic-version'] = '2023-06-01'
-          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31'
+          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31,files-api-2025-04-14'
           req.body = request_body.to_json
         end
 
@@ -145,7 +145,7 @@ module LlmToolkit
           req.headers['Content-Type'] = 'application/json'
           req.headers['x-api-key'] = api_key
           req.headers['anthropic-version'] = '2023-06-01'
-          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31'
+          req.headers['anthropic-beta'] = 'prompt-caching-2024-07-31,files-api-2025-04-14'
           req.body = request_body.to_json
           req.options.on_data = proc do |chunk, size, env|
             handle_anthropic_streaming_chunk(chunk, streaming_state, &block)
