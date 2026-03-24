@@ -215,26 +215,10 @@ module LlmToolkit
           if message.attachments.attached? && provider_type == 'openrouter'
             is_latest_attachment_message = (message.id == last_user_msg_with_attachments_id)
 
-            # Build upload service once per message block (lazy – only created if needed)
-            llm_provider = target_llm_model.llm_provider
-            file_upload_service = LlmToolkit::OpenrouterFileUploadService.new(llm_provider)
-
             message.attachments.each do |attachment|
               begin
-                # Try to obtain/upload the OpenRouter file_id for permanent referencing
-                file_id = file_upload_service.upload_or_get_file_id(attachment)
-
-                if file_id
-                  # Use the file_id for all turns (current and historical) – no re-encoding needed
-                  if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
-                    content_parts << { type: "image_url", image_url: { url: file_id } }
-                  elsif attachment.content_type == 'application/pdf'
-                    content_parts << { type: "file", file: { file_id: file_id } }
-                  else
-                    Rails.logger.warn "Unsupported attachment type for LLM: #{attachment.content_type}, filename: #{attachment.filename}"
-                  end
-                elsif is_latest_attachment_message
-                  # Fallback: inline base64 only for the latest message when upload failed
+                if is_latest_attachment_message
+                  # Latest message with attachments: send the full inline base64 content
                   blob_data = attachment.blob.download
                   base64_data = Base64.strict_encode64(blob_data)
 
@@ -254,9 +238,13 @@ module LlmToolkit
                     Rails.logger.warn "Unsupported attachment type for LLM: #{attachment.content_type}, filename: #{attachment.filename}"
                   end
                 else
-                  # Historical message + upload failed → plain text reference
-                  Rails.logger.info "Skipping inline file content for historical message #{message.id} attachment #{attachment.filename}"
-                  content_parts << { type: "text", text: "[Fichier joint: #{attachment.filename}]" }
+                  # Historical messages: reference filename as text only.
+                  # OpenRouter does not support a persistent file_id API, so re-sending
+                  # large base64 payloads for every historical message would bloat every
+                  # subsequent request. The model has already processed the file content
+                  # in earlier turns and retains that understanding in the conversation.
+                  Rails.logger.info "Skipping inline file content for historical message #{message.id} (#{attachment.filename})"
+                  content_parts << { type: "text", text: "[Fichier joint précédemment: #{attachment.filename}]" }
                 end
               rescue => e
                 Rails.logger.error "Error processing attachment #{attachment.id} for LLM: #{e.message}"
