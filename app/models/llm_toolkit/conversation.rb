@@ -242,8 +242,9 @@ module LlmToolkit
                   end
 
                 elsif provider_type == 'openrouter'
-                  # OpenRouter has no persistent Files API — send full base64 inline every turn.
-                  # The model re-reads the file each time which is correct for agentique use-cases.
+                  # OpenRouter has no persistent Files API and does not support public URLs for PDFs.
+                  # Only base64 inline is supported. Files >= 4MB will exceed payload limits
+                  # and must be rejected upstream (at upload time).
                   content_parts.concat(encode_attachment_as_base64_openrouter(attachment))
                 end
               rescue => e
@@ -685,7 +686,9 @@ module LlmToolkit
       parts
     end
 
-    # Encode an attachment as base64 inline for OpenRouter (no persistent Files API)
+    # Encode an attachment as base64 inline for OpenRouter.
+    # OpenRouter only supports base64 inline for PDFs (no Files API, no public URL support).
+    # Large files (> a few MB) should be rejected at upload time before reaching here.
     def encode_attachment_as_base64_openrouter(attachment)
       parts = []
       blob_data   = attachment.blob.download
@@ -697,8 +700,6 @@ module LlmToolkit
       elsif attachment.content_type == 'application/pdf'
         data_url = "data:application/pdf;base64,#{base64_data}"
         parts << { type: "file", file: { filename: attachment.filename.to_s, file_data: data_url } }
-      else
-        Rails.logger.warn "Unsupported attachment type for OpenRouter: #{attachment.content_type}, filename: #{attachment.filename}"
       end
       parts
     end
