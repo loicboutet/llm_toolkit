@@ -190,6 +190,15 @@ module LlmToolkit
       # Exclude specific message if requested (e.g., the current assistant message being populated)
       base_messages = base_messages.where.not(id: exclude_message_id) if exclude_message_id.present?
 
+      # Find the ID of the last user message with attachments so we only inline
+      # file content for that message. For earlier messages, we reference the
+      # filename as text to avoid re-sending large base64 payloads every turn.
+      last_user_msg_with_attachments_id = base_messages
+        .where(role: 'user')
+        .joins(:attachments_attachments)
+        .order(:created_at)
+        .last&.id
+
       base_messages.each do |message|
         # Skip assistant messages that only contain placeholder content AND have no tool calls
         # These are "thinking..." messages that shouldn't be sent to the LLM
@@ -204,25 +213,34 @@ module LlmToolkit
           content_parts << { type: "text", text: message.content.presence || "" }
 
           if message.attachments.attached? && provider_type == 'openrouter'
+            is_latest_attachment_message = (message.id == last_user_msg_with_attachments_id)
+
             message.attachments.each do |attachment|
               begin
-                blob_data = attachment.blob.download
-                base64_data = Base64.strict_encode64(blob_data)
+                if is_latest_attachment_message
+                  # Latest message with attachments: send the full file content
+                  blob_data = attachment.blob.download
+                  base64_data = Base64.strict_encode64(blob_data)
 
-                if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
-                  data_url = "data:#{attachment.content_type};base64,#{base64_data}"
-                  content_parts << { type: "image_url", image_url: { url: data_url } }
-                elsif attachment.content_type == 'application/pdf'
-                  data_url = "data:application/pdf;base64,#{base64_data}"
-                  content_parts << {
-                    type: "file",
-                    file: {
-                      filename: attachment.filename.to_s,
-                      file_data: data_url
+                  if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
+                    data_url = "data:#{attachment.content_type};base64,#{base64_data}"
+                    content_parts << { type: "image_url", image_url: { url: data_url } }
+                  elsif attachment.content_type == 'application/pdf'
+                    data_url = "data:application/pdf;base64,#{base64_data}"
+                    content_parts << {
+                      type: "file",
+                      file: {
+                        filename: attachment.filename.to_s,
+                        file_data: data_url
+                      }
                     }
-                  }
+                  else
+                    Rails.logger.warn "Unsupported attachment type for LLM: #{attachment.content_type}, filename: #{attachment.filename}"
+                  end
                 else
-                  Rails.logger.warn "Unsupported attachment type for LLM: #{attachment.content_type}, filename: #{attachment.filename}"
+                  # Previous messages: only reference the filename to avoid re-sending large payloads
+                  Rails.logger.info "Skipping inline file content for historical message #{message.id} attachment #{attachment.filename}"
+                  content_parts << { type: "text", text: "[Fichier joint: #{attachment.filename}]" }
                 end
               rescue => e
                 Rails.logger.error "Error processing attachment #{attachment.id} for LLM: #{e.message}"
