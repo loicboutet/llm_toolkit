@@ -223,12 +223,14 @@ module LlmToolkit
                     if attachment.image? && ['image/jpeg', 'image/png', 'image/webp'].include?(attachment.content_type)
                       content_parts << {
                         type: "image",
-                        source: { type: "file", file_id: file_id }
+                        source: { type: "file", file_id: file_id },
+                        cache_control: { type: "ephemeral" }
                       }
                     elsif attachment.content_type == 'application/pdf'
                       content_parts << {
                         type: "document",
-                        source: { type: "file", file_id: file_id }
+                        source: { type: "file", file_id: file_id },
+                        cache_control: { type: "ephemeral" }
                       }
                     else
                       Rails.logger.warn "Unsupported attachment type for Anthropic Files API: #{attachment.content_type}, filename: #{attachment.filename}"
