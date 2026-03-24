@@ -643,7 +643,11 @@ module LlmToolkit
           end
         end
         
-        last_text_index ||= content_array.size - 1
+        # If no text block found, don't add cache_control at all.
+        # file, image_url and other block types don't support cache_control on
+        # Anthropic/Claude (via OpenRouter) — adding it causes subsequent requests
+        # to fail with a 400 error.
+        return content_array unless last_text_index
         
         content_array.each_with_index.map do |item, idx|
           if idx == last_text_index
