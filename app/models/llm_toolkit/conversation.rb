@@ -208,7 +208,12 @@ module LlmToolkit
 
         if message.user_message?
           content_parts = []
-          content_parts << { type: "text", text: message.content.presence || "" }
+          # Only add a text block if there is actual text content.
+          # Anthropic (and OpenRouter/Claude) reject empty text blocks:
+          #   "messages: text content blocks must be non-empty"
+          # This happens when a user sends files with no accompanying text.
+          text_content = message.content.presence
+          content_parts << { type: "text", text: text_content } if text_content
 
           if message.attachments.attached?
             message.attachments.each do |attachment|
