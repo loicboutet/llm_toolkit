@@ -638,15 +638,17 @@ module LlmToolkit
         last_text_index = nil
         content_array.each_with_index do |item, idx|
           item_type = item[:type] || item['type']
-          if item_type == 'text'
+          item_text = item[:text] || item['text']
+          # Only consider non-empty text blocks: Anthropic rejects cache_control
+          # on empty text blocks with "cache_control cannot be set for empty text blocks"
+          if item_type == 'text' && item_text.present?
             last_text_index = idx
           end
         end
         
-        # If no text block found, don't add cache_control at all.
-        # file, image_url and other block types don't support cache_control on
-        # Anthropic/Claude (via OpenRouter) — adding it causes subsequent requests
-        # to fail with a 400 error.
+        # If no non-empty text block found, don't add cache_control at all.
+        # This covers: file-only messages, image-only messages, and messages
+        # where the text block is empty (e.g. user sends files with no text).
         return content_array unless last_text_index
         
         content_array.each_with_index.map do |item, idx|

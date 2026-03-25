@@ -89,6 +89,66 @@ class FileAttachmentCachingTest < ActiveSupport::TestCase
   end
 
   # ─────────────────────────────────────────────────────────────────────────────
+  # Test: Empty text block — must NOT get cache_control (real bug from conv 10416)
+  # User sends files with no text → text block is "" → Anthropic rejects cache_control
+  # with "cache_control cannot be set for empty text blocks"
+  # ─────────────────────────────────────────────────────────────────────────────
+  test "apply_cache_control_to_last_block does not add cache_control on empty text block" do
+    content = [
+      { type: 'text', text: '' },
+      { type: 'file', file: { filename: 'doc.pdf', file_data: 'data:application/pdf;base64,abc' } }
+    ]
+
+    result = @provider.send(:apply_cache_control_to_last_block, content)
+
+    result.each do |block|
+      assert_nil block[:cache_control],
+        "cache_control must NOT be set on any block when text is empty — got it on '#{block[:type]}' block"
+    end
+  end
+
+  test "apply_cache_control_to_last_block does not add cache_control when all text blocks are empty" do
+    content = [
+      { type: 'text', text: '' },
+      { type: 'text', text: '   ' },
+    ]
+
+    result = @provider.send(:apply_cache_control_to_last_block, content)
+
+    result.each do |block|
+      assert_nil block[:cache_control],
+        "cache_control must NOT be set when all text blocks are blank"
+    end
+  end
+
+  test "full pipeline: no cache_control when first user message has only files and empty text" do
+    messages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '' },
+          { type: 'file', file: { filename: 'a.pdf', file_data: 'data:application/pdf;base64,abc' } },
+          { type: 'file', file: { filename: 'b.pdf', file_data: 'data:application/pdf;base64,def' } },
+        ]
+      },
+      { role: 'assistant', content: "J'ai bien reçu les documents." },
+      { role: 'user', content: [{ type: 'text', text: 'Fais une comparaison.' }] }
+    ]
+
+    result = @provider.send(:fix_conversation_history_for_openrouter, messages)
+
+    result.each do |message|
+      next unless message[:content].is_a?(Array)
+      message[:content].each do |block|
+        if block[:type] == 'text' && block[:text].blank?
+          assert_nil block[:cache_control],
+            "cache_control must NOT be set on empty text blocks — this causes Anthropic 400 errors"
+        end
+      end
+    end
+  end
+
+  # ─────────────────────────────────────────────────────────────────────────────
   # Test 5: Full pipeline — fix_conversation_history_for_openrouter does not
   #         put cache_control on file blocks in a multi-turn conversation
   # ─────────────────────────────────────────────────────────────────────────────
